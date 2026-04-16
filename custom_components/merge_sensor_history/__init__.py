@@ -18,6 +18,7 @@ from homeassistant.components.frontend import (
     async_register_built_in_panel,
     async_remove_panel,
 )
+from homeassistant.components.http import StaticPathConfig
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.history import get_significant_states
 from homeassistant.components.recorder.statistics import (
@@ -53,8 +54,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Register the panel
     panel_path = os.path.join(os.path.dirname(__file__), "frontend", "panel.js")
-    hass.http.register_static_path(
-        f"/{DOMAIN}/panel.js", panel_path, cache_headers=True
+    await hass.http.async_register_static_paths(
+        [StaticPathConfig(f"/{DOMAIN}/panel.js", panel_path, cache_headers=True)]
     )
 
     async_register_built_in_panel(
