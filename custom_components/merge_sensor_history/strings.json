@@ -1,0 +1,13 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Merge Sensor History",
+        "description": "This integration adds a panel to import historical sensor data from one entity to another. Click Submit to enable it."
+      }
+    },
+    "abort": {
+      "already_configured": "Merge Sensor History is already configured."
+    }
+  }
+}

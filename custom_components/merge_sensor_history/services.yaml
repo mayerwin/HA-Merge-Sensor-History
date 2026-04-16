@@ -1,0 +1,18 @@
+import_history:
+  name: Import History
+  description: "Import all historical states from a source entity into a destination entity. Only imports data older than the destination's oldest record."
+  fields:
+    source_entity_id:
+      name: Source Entity
+      description: "The entity to copy history FROM (old sensor)."
+      required: true
+      example: "sensor.ecowitt_temperature"
+      selector:
+        entity:
+    destination_entity_id:
+      name: Destination Entity
+      description: "The entity to copy history INTO (new sensor)."
+      required: true
+      example: "sensor.new_temperature"
+      selector:
+        entity:
