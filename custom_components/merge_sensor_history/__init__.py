@@ -289,15 +289,12 @@ async def _do_import(
     result["states_already_covered"] = already_covered
 
     # --- 3. Import statistics via official API (already idempotent) ---
+    # No cutoff needed: async_import_statistics is deduplicated by the DB's
+    # unique constraint on (metadata_id, start_ts). Duplicates are ignored.
     # Done independently: a stats failure should not hide a successful states import.
-    cutoff_dt = (
-        datetime.fromtimestamp(cutoff_ts, tz=timezone.utc)
-        if cutoff_ts is not None
-        else None
-    )
     try:
         stats_count = await _async_import_statistics_for_pair(
-            hass, source_id, dest_id, cutoff_dt
+            hass, source_id, dest_id
         )
         result["stats_imported"] = stats_count
     except Exception as exc:
@@ -509,12 +506,12 @@ async def _async_import_statistics_for_pair(
     hass: HomeAssistant,
     source_id: str,
     dest_id: str,
-    cutoff: datetime | None,
 ) -> int:
     """Import long-term statistics from source to destination.
 
     Uses the official async_import_statistics API which has built-in
     deduplication via unique constraint on (metadata_id, start_ts).
+    No cutoff filtering needed — duplicates are simply ignored by the DB.
     """
     recorder = get_instance(hass)
 
@@ -534,11 +531,6 @@ async def _async_import_statistics_for_pair(
     stat_rows = source_stats.get(source_id, [])
     if not stat_rows:
         return 0
-
-    if cutoff:
-        stat_rows = [r for r in stat_rows if r["start"] < cutoff]
-        if not stat_rows:
-            return 0
 
     # Look up unit info from the entity's current state
     state_obj = hass.states.get(dest_id) or hass.states.get(source_id)
