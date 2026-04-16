@@ -1,14 +1,14 @@
 {
   "domain": "merge_sensor_history",
   "name": "Merge Sensor History",
-  "version": "1.0.0",
-  "config_flow": true,
-  "documentation": "https://github.com/mayerwin/HA-Merge-Sensor-History",
-  "issue_tracker": "https://github.com/mayerwin/HA-Merge-Sensor-History/issues",
-  "requirements": [],
-  "dependencies": ["recorder", "frontend", "http"],
   "after_dependencies": ["history"],
   "codeowners": ["@mayerwin"],
+  "config_flow": true,
+  "dependencies": ["recorder", "frontend", "http"],
+  "documentation": "https://github.com/mayerwin/HA-Merge-Sensor-History",
+  "integration_type": "service",
   "iot_class": "local_push",
-  "integration_type": "service"
+  "issue_tracker": "https://github.com/mayerwin/HA-Merge-Sensor-History/issues",
+  "requirements": [],
+  "version": "1.0.0"
 }
