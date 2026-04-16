@@ -532,46 +532,23 @@ async def _async_import_statistics_for_pair(
     if not stat_rows:
         return 0
 
-    # Look up unit info from the entity's current state
+    # Look up unit from the entity's current state
     state_obj = hass.states.get(dest_id) or hass.states.get(source_id)
     unit = None
-    device_class = None
     if state_obj:
         unit = state_obj.attributes.get("unit_of_measurement")
-        device_class = state_obj.attributes.get("device_class")
 
     has_sum = any(r.get("sum") is not None for r in stat_rows)
     has_mean = any(r.get("mean") is not None for r in stat_rows)
 
-    unit_class_map = {
-        "temperature": "temperature",
-        "humidity": "humidity",
-        "pressure": "pressure",
-        "energy": "energy",
-        "power": "power",
-        "voltage": "voltage",
-        "current": "current",
-        "battery": "battery",
-        "illuminance": "illuminance",
-        "speed": "speed",
-        "wind_speed": "wind_speed",
-        "precipitation": "precipitation",
-        "precipitation_intensity": "precipitation_intensity",
-        "distance": "distance",
-        "volume": "volume",
-        "weight": "weight",
-        "irradiance": "irradiance",
-    }
-    unit_class = unit_class_map.get(device_class) if device_class else None
-
     # Build metadata — handle both old (has_mean: bool) and new (mean_type)
-    # HA API versions.
+    # HA API versions. unit_class is left as None — it's only used for HA's
+    # internal unit conversion and not required for importing statistics.
     meta_kwargs: dict[str, Any] = {
         "has_sum": has_sum,
         "name": None,
         "source": "recorder",
         "statistic_id": dest_id,
-        "unit_class": unit_class,
         "unit_of_measurement": unit,
     }
     if StatisticMeanType is not None:
