@@ -631,7 +631,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     // Remove everything that isn't a printable ASCII char (entity IDs are
     // domain.object_id — only lowercase alphanumeric, underscores, dots).
     // This catches non-breaking spaces, zero-width chars, smart quotes, BOM, etc.
-    return raw.replace(/[^\x20-\x7E]/g, "").trim();
+    return raw.replace(/[^\x09\x20-\x7E]/g, "").trim();
   }
 
   _handleBulkAdd() {
