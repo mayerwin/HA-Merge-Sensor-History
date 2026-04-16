@@ -338,6 +338,92 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           font-size: 14px;
         }
 
+        .bulk-section {
+          margin-bottom: 16px;
+        }
+        .bulk-toggle {
+          background: none;
+          border: none;
+          color: var(--primary-color, #03a9f4);
+          font-size: 13px;
+          cursor: pointer;
+          padding: 4px 0;
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          font-family: inherit;
+        }
+        .bulk-toggle:hover {
+          text-decoration: underline;
+        }
+        .bulk-toggle .chevron {
+          display: inline-block;
+          transition: transform 0.2s;
+          font-size: 10px;
+        }
+        .bulk-toggle .chevron.open {
+          transform: rotate(90deg);
+        }
+        .bulk-body {
+          display: none;
+          margin-top: 10px;
+        }
+        .bulk-body.open {
+          display: block;
+        }
+        .bulk-body textarea {
+          width: 100%;
+          min-height: 100px;
+          padding: 10px 12px;
+          border: 1px solid var(--divider-color, #e0e0e0);
+          border-radius: 8px;
+          font-size: 13px;
+          font-family: "Roboto Mono", "Consolas", "Monaco", monospace;
+          background: var(--input-fill-color, var(--secondary-background-color, #f5f5f5));
+          color: var(--primary-text-color);
+          box-sizing: border-box;
+          resize: vertical;
+          line-height: 1.6;
+        }
+        .bulk-body textarea::placeholder {
+          color: var(--secondary-text-color, #999);
+          opacity: 0.8;
+          font-family: inherit;
+        }
+        .bulk-body textarea:focus {
+          outline: none;
+          border-color: var(--primary-color, #03a9f4);
+          box-shadow: 0 0 0 1px var(--primary-color, #03a9f4);
+        }
+        .bulk-hint {
+          font-size: 12px;
+          color: var(--secondary-text-color);
+          margin-top: 6px;
+          line-height: 1.5;
+        }
+        .bulk-actions {
+          margin-top: 10px;
+          display: flex;
+          align-items: center;
+          gap: 12px;
+        }
+        .bulk-error {
+          margin-top: 10px;
+          padding: 10px 14px;
+          border-radius: 6px;
+          font-size: 13px;
+          background: color-mix(in srgb, var(--error-color, #db4437) 12%, transparent);
+          border: 1px solid color-mix(in srgb, var(--error-color, #db4437) 30%, transparent);
+          color: var(--primary-text-color);
+          line-height: 1.6;
+        }
+        .bulk-error code {
+          background: color-mix(in srgb, var(--error-color, #db4437) 8%, transparent);
+          padding: 1px 5px;
+          border-radius: 3px;
+          font-size: 12px;
+        }
+
         @media (max-width: 600px) {
           .pair-row {
             flex-direction: column;
@@ -375,6 +461,22 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           <span class="search-icon">&#128269;</span>
           <input type="text" id="entity-filter" placeholder="Filter entities by name or ID..." />
         </div>
+        <div class="bulk-section">
+          <button class="bulk-toggle" id="bulk-toggle">
+            <span class="chevron" id="bulk-chevron">&#9654;</span>
+            Bulk add pairs
+          </button>
+          <div class="bulk-body" id="bulk-body">
+            <textarea id="bulk-textarea" placeholder="sensor.old_temp, sensor.new_temp&#10;sensor.old_humidity&#9;sensor.new_humidity&#10;..."></textarea>
+            <div class="bulk-hint">
+              One pair per line. Separate source and destination with a <strong>comma</strong> or <strong>tab</strong>.
+            </div>
+            <div class="bulk-actions">
+              <button class="btn btn-secondary" id="bulk-add-btn">Add Pairs</button>
+            </div>
+            <div id="bulk-error"></div>
+          </div>
+        </div>
         <div id="pairs-container"></div>
         <div class="actions">
           <button class="btn btn-secondary" id="add-pair-btn">+ Add Pair</button>
@@ -389,6 +491,10 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     this._resultsContainer = shadow.getElementById("results-container");
     this._importBtn = shadow.getElementById("import-btn");
     this._filterInput = shadow.getElementById("entity-filter");
+    this._bulkBody = shadow.getElementById("bulk-body");
+    this._bulkChevron = shadow.getElementById("bulk-chevron");
+    this._bulkTextarea = shadow.getElementById("bulk-textarea");
+    this._bulkError = shadow.getElementById("bulk-error");
 
     shadow.getElementById("add-pair-btn").addEventListener("click", () => {
       this._pairs.push({ source: "", destination: "" });
@@ -399,6 +505,15 @@ class MergeSensorsHistoryPanel extends HTMLElement {
 
     this._filterInput.addEventListener("input", () => {
       this._renderPairs();
+    });
+
+    shadow.getElementById("bulk-toggle").addEventListener("click", () => {
+      const open = this._bulkBody.classList.toggle("open");
+      this._bulkChevron.classList.toggle("open", open);
+    });
+
+    shadow.getElementById("bulk-add-btn").addEventListener("click", () => {
+      this._handleBulkAdd();
     });
 
     this._renderPairs();
@@ -509,6 +624,72 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       row.appendChild(removeCol);
       container.appendChild(row);
     });
+  }
+
+  _handleBulkAdd() {
+    const text = this._bulkTextarea.value.trim();
+    this._bulkError.innerHTML = "";
+
+    if (!text) {
+      this._bulkError.innerHTML = '<div class="bulk-error">Please enter at least one pair.</div>';
+      return;
+    }
+
+    const knownEntities = this._hass ? new Set(Object.keys(this._hass.states)) : new Set();
+    const parsed = [];
+    const parseErrors = [];
+    const invalidIds = new Set();
+
+    const lines = text.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+
+      // Split by tab first, then comma
+      let parts;
+      if (line.includes("\t")) {
+        parts = line.split("\t").map((s) => s.trim()).filter(Boolean);
+      } else {
+        parts = line.split(",").map((s) => s.trim()).filter(Boolean);
+      }
+
+      if (parts.length !== 2) {
+        parseErrors.push(`Line ${i + 1}: expected 2 entities, got ${parts.length} &mdash; <code>${lines[i].trim()}</code>`);
+        continue;
+      }
+
+      const [source, destination] = parts;
+      if (!knownEntities.has(source)) invalidIds.add(source);
+      if (!knownEntities.has(destination)) invalidIds.add(destination);
+      parsed.push({ source, destination });
+    }
+
+    if (parseErrors.length > 0) {
+      this._bulkError.innerHTML = `<div class="bulk-error"><strong>Could not parse:</strong><br/>${parseErrors.join("<br/>")}</div>`;
+      return;
+    }
+
+    if (invalidIds.size > 0) {
+      const list = [...invalidIds].map((id) => `<code>${id}</code>`).join(", ");
+      this._bulkError.innerHTML = `<div class="bulk-error"><strong>Unknown entity IDs:</strong> ${list}<br/>No pairs were added. Please fix the IDs and try again.</div>`;
+      return;
+    }
+
+    if (parsed.length === 0) {
+      this._bulkError.innerHTML = '<div class="bulk-error">No valid pairs found in the input.</div>';
+      return;
+    }
+
+    // Remove the initial empty pair if it's still the only one and untouched
+    if (this._pairs.length === 1 && !this._pairs[0].source && !this._pairs[0].destination) {
+      this._pairs = [];
+    }
+
+    this._pairs.push(...parsed);
+    this._bulkTextarea.value = "";
+    this._bulkBody.classList.remove("open");
+    this._bulkChevron.classList.remove("open");
+    this._renderPairs();
   }
 
   async _doImport() {
