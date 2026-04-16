@@ -584,7 +584,12 @@ async def _async_import_statistics_for_pair(
 
     stats_data = []
     for row in stat_rows:
-        entry: dict[str, Any] = {"start": row["start"]}
+        # statistics_during_period returns start as a float epoch timestamp;
+        # StatisticData expects a datetime. Normalize to datetime.
+        start = row["start"]
+        if isinstance(start, (int, float)):
+            start = datetime.fromtimestamp(start, tz=timezone.utc)
+        entry: dict[str, Any] = {"start": start}
         for key in ("mean", "min", "max", "sum", "state"):
             if row.get(key) is not None:
                 entry[key] = row[key]
