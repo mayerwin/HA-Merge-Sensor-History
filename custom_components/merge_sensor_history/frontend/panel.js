@@ -290,9 +290,34 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           color: var(--secondary-text-color);
           padding-left: 26px;
         }
-        .result-details span {
-          display: inline-block;
-          margin-right: 16px;
+        .result-stat-grid {
+          display: grid;
+          grid-template-columns: auto 1fr;
+          gap: 3px 12px;
+          padding-left: 26px;
+          margin-top: 6px;
+          font-size: 13px;
+        }
+        .result-stat-value {
+          font-weight: 600;
+          color: var(--primary-text-color);
+          text-align: right;
+        }
+        .result-stat-label {
+          color: var(--secondary-text-color);
+        }
+        .result-stat-grid > .result-stat-label:first-child,
+        .result-stat-grid > .result-stat-label[style*="margin-top"] {
+          font-weight: 600;
+          color: var(--primary-text-color);
+          font-size: 12px;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+        }
+        .result-stat-error {
+          color: var(--error-color, #db4437);
+          grid-column: 1 / -1;
+          margin-top: 4px;
         }
         .spinner {
           display: inline-block;
@@ -572,26 +597,40 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         const nothingToDo =
           r.states_imported === 0 && r.stats_imported === 0 && !r.stats_error;
 
-        const details = [];
-        if (r.states_imported > 0)
-          details.push(`<span><strong>${r.states_imported}</strong> states imported</span>`);
-        if (r.states_already_covered > 0)
-          details.push(`<span>${r.states_already_covered} already covered</span>`);
-        if (r.stats_imported > 0)
-          details.push(`<span><strong>${r.stats_imported}</strong> statistic rows imported</span>`);
-        if (r.source_total > 0)
-          details.push(`<span>${r.source_total} total source states</span>`);
-        if (r.stats_error)
-          details.push(`<span style="color:var(--error-color,#db4437)">Stats error: ${r.stats_error}</span>`);
+        if (nothingToDo) {
+          return `<div class="result-item result-success">
+            <div class="result-header">
+              <span class="result-icon">&#9989;</span>
+              ${pairLabel}
+            </div>
+            <div class="result-details">Already up to date &mdash; nothing to import.</div>
+          </div>`;
+        }
+
+        let grid = "";
+        // States summary
+        if (r.source_total > 0) {
+          grid += `<span class="result-stat-label">States</span><span class="result-stat-label"></span>`;
+          grid += `<span class="result-stat-value">${r.source_total.toLocaleString()}</span><span class="result-stat-label">total in source</span>`;
+          if (r.states_already_covered > 0)
+            grid += `<span class="result-stat-value">${r.states_already_covered.toLocaleString()}</span><span class="result-stat-label">already present in destination</span>`;
+          grid += `<span class="result-stat-value">${r.states_imported.toLocaleString()}</span><span class="result-stat-label">imported</span>`;
+        }
+        // Statistics summary
+        if (r.stats_imported > 0 || r.stats_error) {
+          grid += `<span class="result-stat-label" style="margin-top:6px">Statistics</span><span class="result-stat-label"></span>`;
+          if (r.stats_imported > 0)
+            grid += `<span class="result-stat-value">${r.stats_imported.toLocaleString()}</span><span class="result-stat-label">long-term statistic rows imported</span>`;
+          if (r.stats_error)
+            grid += `<span class="result-stat-error">Error: ${r.stats_error}</span>`;
+        }
 
         return `<div class="result-item result-success">
           <div class="result-header">
-            <span class="result-icon">${nothingToDo ? "&#9989;" : "&#9989;"}</span>
+            <span class="result-icon">&#9989;</span>
             ${pairLabel}
           </div>
-          <div class="result-details">
-            ${nothingToDo ? "Nothing to import (already up to date)." : details.join("")}
-          </div>
+          <div class="result-stat-grid">${grid}</div>
         </div>`;
       })
       .join("");
