@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -56,8 +57,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN].setdefault("_locks", {})
 
-    # Register the panel
+    # Register the panel with cache-busting hash
     panel_path = os.path.join(os.path.dirname(__file__), "frontend", "panel.js")
+    with open(panel_path, "rb") as f:
+        panel_hash = hashlib.md5(f.read()).hexdigest()[:8]
+
     await hass.http.async_register_static_paths(
         [StaticPathConfig(f"/{DOMAIN}/panel.js", panel_path, cache_headers=True)]
     )
@@ -71,7 +75,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         config={
             "_panel_custom": {
                 "name": "merge-sensor-history-panel",
-                "module_url": f"/{DOMAIN}/panel.js",
+                "module_url": f"/{DOMAIN}/panel.js?v={panel_hash}",
                 "embed_iframe": False,
             }
         },
@@ -519,9 +523,10 @@ async def _async_import_statistics_for_pair(
             statistics_during_period,
             hass,
             _EPOCH,
-            None,  # end_time — explicit positional to avoid ambiguity
+            None,  # end_time
             statistic_ids={source_id},
             period="hour",
+            units=None,  # no unit conversion — keep original units
             types={"mean", "min", "max", "sum", "state"},
         )
     )
