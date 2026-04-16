@@ -626,6 +626,14 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     });
   }
 
+  /** Strip invisible/non-printable characters and normalize whitespace. */
+  _cleanId(raw) {
+    // Remove everything that isn't a printable ASCII char (entity IDs are
+    // domain.object_id — only lowercase alphanumeric, underscores, dots).
+    // This catches non-breaking spaces, zero-width chars, smart quotes, BOM, etc.
+    return raw.replace(/[^\x20-\x7E]/g, "").trim();
+  }
+
   _handleBulkAdd() {
     const text = this._bulkTextarea.value.trim();
     this._bulkError.innerHTML = "";
@@ -640,9 +648,9 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     const parseErrors = [];
     const invalidIds = new Set();
 
-    const lines = text.split("\n");
+    const lines = text.split(/\r?\n/);
     for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
+      const line = this._cleanId(lines[i]);
       if (!line) continue;
 
       // Split by tab first, then comma
@@ -654,7 +662,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       }
 
       if (parts.length !== 2) {
-        parseErrors.push(`Line ${i + 1}: expected 2 entities, got ${parts.length} &mdash; <code>${lines[i].trim()}</code>`);
+        parseErrors.push(`Line ${i + 1}: expected 2 entities, got ${parts.length} &mdash; <code>${line}</code>`);
         continue;
       }
 
