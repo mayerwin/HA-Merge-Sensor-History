@@ -1,5 +1,5 @@
 /**
- * Merge Sensors History - Custom Panel
+ * Merge Sensor History - Custom Panel
  *
  * Provides a UI to select source/destination entity pairs
  * and import historical data between them.
@@ -24,139 +24,280 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     this._panel = panel;
   }
 
+  /** Get friendly name for an entity, or empty string if not found. */
+  _friendlyName(entityId) {
+    if (!entityId || !this._hass) return "";
+    const stateObj = this._hass.states[entityId];
+    if (!stateObj) return "";
+    const name = stateObj.attributes.friendly_name;
+    return name && name !== entityId ? name : "";
+  }
+
   _render() {
     const shadow = this.attachShadow({ mode: "open" });
     shadow.innerHTML = `
       <style>
         :host {
           display: block;
-          padding: 16px;
-          max-width: 900px;
+          padding: 24px 16px;
+          max-width: 960px;
           margin: 0 auto;
           font-family: var(--paper-font-body1_-_font-family, "Roboto", sans-serif);
           color: var(--primary-text-color, #212121);
+          -webkit-font-smoothing: antialiased;
         }
         .card {
           background: var(--ha-card-background, var(--card-background-color, white));
           border-radius: var(--ha-card-border-radius, 12px);
-          box-shadow: var(--ha-card-box-shadow, 0 2px 6px rgba(0,0,0,0.1));
-          padding: 24px;
+          box-shadow: var(--ha-card-box-shadow, 0 2px 8px rgba(0,0,0,0.08));
+          padding: 28px;
           margin-bottom: 16px;
         }
+        .header {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          margin-bottom: 6px;
+        }
+        .header-icon {
+          font-size: 28px;
+          opacity: 0.8;
+        }
         h1 {
-          font-size: 24px;
-          font-weight: 400;
-          margin: 0 0 8px 0;
+          font-size: 22px;
+          font-weight: 500;
+          margin: 0;
           color: var(--primary-text-color);
         }
         .subtitle {
           color: var(--secondary-text-color, #727272);
           font-size: 14px;
-          margin-bottom: 24px;
+          margin-bottom: 20px;
+          line-height: 1.6;
+        }
+        .warning-banner {
+          display: flex;
+          align-items: flex-start;
+          gap: 10px;
+          background: color-mix(in srgb, var(--warning-color, #ff9800) 12%, transparent);
+          border: 1px solid color-mix(in srgb, var(--warning-color, #ff9800) 30%, transparent);
+          color: var(--primary-text-color);
+          padding: 14px 16px;
+          border-radius: 8px;
+          margin-bottom: 20px;
+          font-size: 13px;
           line-height: 1.5;
+        }
+        .warning-banner .warn-icon {
+          font-size: 18px;
+          flex-shrink: 0;
+          margin-top: 1px;
+        }
+        .filter-row {
+          margin-bottom: 16px;
+          position: relative;
+        }
+        .filter-row input {
+          width: 100%;
+          padding: 10px 14px 10px 38px;
+          border: 1px solid var(--divider-color, #e0e0e0);
+          border-radius: 8px;
+          font-size: 14px;
+          background: var(--input-fill-color, var(--secondary-background-color, #f5f5f5));
+          color: var(--primary-text-color);
+          box-sizing: border-box;
+          transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        .filter-row input::placeholder {
+          color: var(--secondary-text-color, #999);
+          opacity: 0.8;
+        }
+        .filter-row input:focus {
+          outline: none;
+          border-color: var(--primary-color, #03a9f4);
+          box-shadow: 0 0 0 1px var(--primary-color, #03a9f4);
+        }
+        .filter-row .search-icon {
+          position: absolute;
+          left: 12px;
+          top: 50%;
+          transform: translateY(-50%);
+          font-size: 16px;
+          color: var(--secondary-text-color);
+          pointer-events: none;
         }
         .pair-row {
           display: flex;
-          align-items: center;
+          align-items: flex-start;
           gap: 12px;
-          margin-bottom: 12px;
-          padding: 12px;
+          margin-bottom: 14px;
+          padding: 16px;
           background: var(--secondary-background-color, #f5f5f5);
-          border-radius: 8px;
+          border-radius: 10px;
+          border: 1px solid var(--divider-color, #e0e0e0);
+          transition: border-color 0.2s;
+        }
+        .pair-row:hover {
+          border-color: color-mix(in srgb, var(--primary-color, #03a9f4) 40%, transparent);
         }
         .pair-row .entity-col {
           flex: 1;
+          min-width: 0;
         }
         .pair-row label {
           display: block;
-          font-size: 12px;
-          font-weight: 500;
+          font-size: 11px;
+          font-weight: 600;
           color: var(--secondary-text-color);
-          margin-bottom: 4px;
+          margin-bottom: 6px;
           text-transform: uppercase;
-          letter-spacing: 0.5px;
+          letter-spacing: 0.8px;
         }
         .pair-row select {
           width: 100%;
-          padding: 8px 12px;
+          padding: 9px 12px;
           border: 1px solid var(--divider-color, #e0e0e0);
           border-radius: 6px;
-          font-size: 14px;
-          background: var(--ha-card-background, white);
+          font-size: 13px;
+          background: var(--ha-card-background, var(--card-background-color, white));
           color: var(--primary-text-color);
           cursor: pointer;
           appearance: auto;
+          transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        .pair-row select option {
+          color: var(--primary-text-color);
+          background: var(--ha-card-background, var(--card-background-color, white));
         }
         .pair-row select:focus {
           outline: none;
           border-color: var(--primary-color, #03a9f4);
           box-shadow: 0 0 0 1px var(--primary-color, #03a9f4);
         }
-        .arrow {
-          font-size: 20px;
-          color: var(--secondary-text-color);
-          padding-top: 18px;
+        .entity-info {
+          margin-top: 5px;
+          font-size: 12px;
+          color: var(--secondary-text-color, #727272);
+          min-height: 18px;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          font-style: italic;
+        }
+        .arrow-col {
+          display: flex;
+          align-items: center;
+          padding-top: 24px;
+          font-size: 22px;
+          color: var(--primary-color, #03a9f4);
+          opacity: 0.7;
+          flex-shrink: 0;
+        }
+        .remove-col {
+          display: flex;
+          align-items: center;
+          padding-top: 24px;
+          flex-shrink: 0;
         }
         .btn {
-          padding: 8px 20px;
+          padding: 9px 22px;
           border: none;
-          border-radius: 6px;
+          border-radius: 8px;
           font-size: 14px;
           font-weight: 500;
           cursor: pointer;
-          transition: background 0.2s, opacity 0.2s;
+          transition: background 0.2s, opacity 0.2s, transform 0.1s;
+          user-select: none;
+        }
+        .btn:active:not(:disabled) {
+          transform: scale(0.98);
         }
         .btn:disabled {
-          opacity: 0.5;
+          opacity: 0.45;
           cursor: not-allowed;
         }
         .btn-primary {
           background: var(--primary-color, #03a9f4);
           color: var(--text-primary-color, white);
+          min-width: 140px;
         }
         .btn-primary:hover:not(:disabled) {
-          filter: brightness(1.1);
+          filter: brightness(1.08);
         }
         .btn-secondary {
-          background: var(--secondary-background-color, #f5f5f5);
-          color: var(--primary-text-color);
-          border: 1px solid var(--divider-color, #e0e0e0);
+          background: transparent;
+          color: var(--primary-color, #03a9f4);
+          border: 1px solid var(--primary-color, #03a9f4);
         }
-        .btn-danger {
+        .btn-secondary:hover:not(:disabled) {
+          background: color-mix(in srgb, var(--primary-color, #03a9f4) 8%, transparent);
+        }
+        .btn-remove {
           background: none;
-          color: var(--error-color, #db4437);
+          border: none;
+          color: var(--secondary-text-color, #999);
+          font-size: 22px;
           padding: 4px 8px;
-          font-size: 20px;
-          min-width: 36px;
-          padding-top: 18px;
+          cursor: pointer;
+          border-radius: 4px;
+          line-height: 1;
+          transition: color 0.2s, background 0.2s;
+        }
+        .btn-remove:hover {
+          color: var(--error-color, #db4437);
+          background: color-mix(in srgb, var(--error-color, #db4437) 10%, transparent);
         }
         .actions {
           display: flex;
           gap: 12px;
-          margin-top: 16px;
+          margin-top: 20px;
           align-items: center;
         }
         .results {
-          margin-top: 16px;
+          margin-top: 20px;
         }
         .result-item {
-          padding: 12px;
-          border-radius: 6px;
-          margin-bottom: 8px;
+          padding: 14px 16px;
+          border-radius: 8px;
+          margin-bottom: 10px;
           font-size: 14px;
+          line-height: 1.6;
         }
         .result-success {
-          background: var(--success-color, #4caf50);
-          color: white;
+          background: color-mix(in srgb, var(--success-color, #4caf50) 12%, transparent);
+          border: 1px solid color-mix(in srgb, var(--success-color, #4caf50) 30%, transparent);
+          color: var(--primary-text-color);
         }
+        .result-success .result-icon { color: var(--success-color, #4caf50); }
         .result-error {
-          background: var(--error-color, #db4437);
-          color: white;
+          background: color-mix(in srgb, var(--error-color, #db4437) 12%, transparent);
+          border: 1px solid color-mix(in srgb, var(--error-color, #db4437) 30%, transparent);
+          color: var(--primary-text-color);
+        }
+        .result-error .result-icon { color: var(--error-color, #db4437); }
+        .result-header {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          font-weight: 500;
+          margin-bottom: 4px;
+        }
+        .result-icon {
+          font-size: 18px;
+        }
+        .result-details {
+          font-size: 13px;
+          color: var(--secondary-text-color);
+          padding-left: 26px;
+        }
+        .result-details span {
+          display: inline-block;
+          margin-right: 16px;
         }
         .spinner {
           display: inline-block;
-          width: 18px;
-          height: 18px;
+          width: 16px;
+          height: 16px;
           border: 2px solid rgba(255,255,255,0.3);
           border-top-color: white;
           border-radius: 50%;
@@ -165,46 +306,49 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           margin-right: 8px;
         }
         @keyframes spin { to { transform: rotate(360deg); } }
-        .warning {
-          background: var(--warning-color, #ff9800);
-          color: white;
-          padding: 12px;
-          border-radius: 6px;
-          margin-bottom: 16px;
-          font-size: 13px;
-          line-height: 1.5;
-        }
-        .filter-row {
-          margin-bottom: 12px;
-        }
-        .filter-row input {
-          width: 100%;
-          padding: 8px 12px;
-          border: 1px solid var(--divider-color, #e0e0e0);
-          border-radius: 6px;
+        .empty-state {
+          text-align: center;
+          padding: 32px 16px;
+          color: var(--secondary-text-color);
           font-size: 14px;
-          background: var(--ha-card-background, white);
-          color: var(--primary-text-color);
-          box-sizing: border-box;
         }
-        .filter-row input:focus {
-          outline: none;
-          border-color: var(--primary-color, #03a9f4);
+
+        @media (max-width: 600px) {
+          .pair-row {
+            flex-direction: column;
+            gap: 8px;
+          }
+          .arrow-col {
+            padding-top: 0;
+            justify-content: center;
+            transform: rotate(90deg);
+          }
+          .remove-col {
+            padding-top: 0;
+            align-self: flex-end;
+          }
         }
       </style>
       <div class="card">
-        <h1>Merge Sensors History</h1>
+        <div class="header">
+          <span class="header-icon">&#128337;</span>
+          <h1>Merge Sensor History</h1>
+        </div>
         <p class="subtitle">
-          Import historical data from source sensors into destination sensors.
-          Only data older than the destination's oldest record will be imported (no duplicates).
+          Import historical data from source sensors into destination sensors.<br/>
+          Only data older than the destination's oldest record will be imported &mdash; no duplicates.
         </p>
-        <div class="warning">
-          This operation writes directly to the recorder database. It is recommended to
-          <strong>back up your Home Assistant database</strong> before importing.
-          Imported states will appear in history graphs after the next recorder refresh.
+        <div class="warning-banner">
+          <span class="warn-icon">&#9888;</span>
+          <span>
+            This writes directly to the recorder database.
+            <strong>Back up your database</strong> before importing.
+            Imported states will appear in history graphs after the next recorder refresh.
+          </span>
         </div>
         <div class="filter-row">
-          <input type="text" id="entity-filter" placeholder="Filter entities (e.g. ecowitt, temperature)..." />
+          <span class="search-icon">&#128269;</span>
+          <input type="text" id="entity-filter" placeholder="Filter entities by name or ID..." />
         </div>
         <div id="pairs-container"></div>
         <div class="actions">
@@ -240,21 +384,27 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     const filter = (this._filterInput?.value || "").toLowerCase();
     const entities = Object.keys(this._hass.states).sort();
     if (!filter) return entities;
-    return entities.filter((e) => e.toLowerCase().includes(filter));
+    return entities.filter((e) => {
+      if (e.toLowerCase().includes(filter)) return true;
+      const name = this._friendlyName(e);
+      return name && name.toLowerCase().includes(filter);
+    });
   }
 
   _buildOptions(entities, selected) {
-    // Always include the currently selected value so it stays visible
-    // even when the filter would otherwise hide it.
     let opts = '<option value="">-- Select entity --</option>';
     const seen = new Set();
     if (selected && !entities.includes(selected)) {
-      opts += `<option value="${selected}" selected>${selected} (filtered)</option>`;
+      const name = this._friendlyName(selected);
+      const label = name ? `${selected} (${name}) [filtered]` : `${selected} [filtered]`;
+      opts += `<option value="${selected}" selected>${label}</option>`;
       seen.add(selected);
     }
     for (const e of entities) {
       if (seen.has(e)) continue;
-      opts += `<option value="${e}" ${e === selected ? "selected" : ""}>${e}</option>`;
+      const name = this._friendlyName(e);
+      const label = name ? `${e} (${name})` : e;
+      opts += `<option value="${e}" ${e === selected ? "selected" : ""}>${label}</option>`;
     }
     return opts;
   }
@@ -268,37 +418,57 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       const row = document.createElement("div");
       row.className = "pair-row";
 
+      // --- Source column ---
       const sourceCol = document.createElement("div");
       sourceCol.className = "entity-col";
       const sourceLabel = document.createElement("label");
       sourceLabel.textContent = "Source (old sensor)";
       const sourceSelect = document.createElement("select");
       sourceSelect.innerHTML = this._buildOptions(entities, pair.source);
+
+      const sourceInfo = document.createElement("div");
+      sourceInfo.className = "entity-info";
+      sourceInfo.textContent = this._friendlyName(pair.source);
+
       sourceSelect.addEventListener("change", (ev) => {
         this._pairs[index].source = ev.target.value;
+        sourceInfo.textContent = this._friendlyName(ev.target.value);
       });
       sourceCol.appendChild(sourceLabel);
       sourceCol.appendChild(sourceSelect);
+      sourceCol.appendChild(sourceInfo);
 
+      // --- Arrow ---
       const arrow = document.createElement("div");
-      arrow.className = "arrow";
-      arrow.textContent = "\u2192";
+      arrow.className = "arrow-col";
+      arrow.innerHTML = "&#8594;";
 
+      // --- Destination column ---
       const destCol = document.createElement("div");
       destCol.className = "entity-col";
       const destLabel = document.createElement("label");
       destLabel.textContent = "Destination (new sensor)";
       const destSelect = document.createElement("select");
       destSelect.innerHTML = this._buildOptions(entities, pair.destination);
+
+      const destInfo = document.createElement("div");
+      destInfo.className = "entity-info";
+      destInfo.textContent = this._friendlyName(pair.destination);
+
       destSelect.addEventListener("change", (ev) => {
         this._pairs[index].destination = ev.target.value;
+        destInfo.textContent = this._friendlyName(ev.target.value);
       });
       destCol.appendChild(destLabel);
       destCol.appendChild(destSelect);
+      destCol.appendChild(destInfo);
 
+      // --- Remove button ---
+      const removeCol = document.createElement("div");
+      removeCol.className = "remove-col";
       const removeBtn = document.createElement("button");
-      removeBtn.className = "btn btn-danger";
-      removeBtn.textContent = "\u00d7";
+      removeBtn.className = "btn-remove";
+      removeBtn.innerHTML = "&#215;";
       removeBtn.title = "Remove pair";
       removeBtn.addEventListener("click", () => {
         if (this._pairs.length > 1) {
@@ -306,17 +476,17 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           this._renderPairs();
         }
       });
+      removeCol.appendChild(removeBtn);
 
       row.appendChild(sourceCol);
       row.appendChild(arrow);
       row.appendChild(destCol);
-      row.appendChild(removeBtn);
+      row.appendChild(removeCol);
       container.appendChild(row);
     });
   }
 
   async _doImport() {
-    // Validate pairs
     const validPairs = this._pairs.filter((p) => p.source && p.destination);
     if (validPairs.length === 0) {
       alert("Please select at least one complete source/destination pair.");
@@ -329,10 +499,20 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       return;
     }
 
+    const pairLines = validPairs
+      .map((p) => {
+        const sn = this._friendlyName(p.source);
+        const dn = this._friendlyName(p.destination);
+        const src = sn ? `${p.source} (${sn})` : p.source;
+        const dst = dn ? `${p.destination} (${dn})` : p.destination;
+        return `  ${src}  \u2192  ${dst}`;
+      })
+      .join("\n");
+
     if (
       !confirm(
         `Import history for ${validPairs.length} pair(s)?\n\n` +
-          validPairs.map((p) => `  ${p.source}  \u2192  ${p.destination}`).join("\n") +
+          pairLines +
           "\n\nThis will write to your recorder database."
       )
     ) {
@@ -341,7 +521,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
 
     this._importing = true;
     this._importBtn.disabled = true;
-    this._importBtn.innerHTML = '<span class="spinner"></span>Importing...';
+    this._importBtn.innerHTML = '<span class="spinner"></span>Importing\u2026';
     this._resultsContainer.innerHTML = "";
 
     try {
@@ -354,7 +534,11 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     } catch (err) {
       this._resultsContainer.innerHTML = `
         <div class="result-item result-error">
-          Import failed: ${err.message || err}
+          <div class="result-header">
+            <span class="result-icon">&#10060;</span>
+            Import failed
+          </div>
+          <div class="result-details">${err.message || err}</div>
         </div>`;
     } finally {
       this._importing = false;
@@ -366,31 +550,48 @@ class MergeSensorsHistoryPanel extends HTMLElement {
   _renderResults(results) {
     this._resultsContainer.innerHTML = results
       .map((r) => {
+        const srcName = this._friendlyName(r.source);
+        const dstName = this._friendlyName(r.destination);
+        const srcLabel = srcName ? `${r.source} (${srcName})` : r.source;
+        const dstLabel = dstName ? `${r.destination} (${dstName})` : r.destination;
+        const pairLabel = `${srcLabel} \u2192 ${dstLabel}`;
+
         if (r.error) {
           return `<div class="result-item result-error">
-            <strong>${r.source} \u2192 ${r.destination}</strong><br/>
-            Error: ${r.error}<br/>
-            <em>No data was written — the import was rolled back.</em>
+            <div class="result-header">
+              <span class="result-icon">&#10060;</span>
+              ${pairLabel}
+            </div>
+            <div class="result-details">
+              ${r.error}<br/>
+              <em>No data was written &mdash; the import was rolled back.</em>
+            </div>
           </div>`;
         }
+
+        const nothingToDo =
+          r.states_imported === 0 && r.stats_imported === 0 && !r.stats_error;
+
         const details = [];
-        details.push(`${r.states_imported} states imported`);
-        if (r.states_already_covered > 0) {
-          details.push(`${r.states_already_covered} already covered by destination`);
-        }
-        if (r.stats_imported > 0) {
-          details.push(`${r.stats_imported} statistic rows imported`);
-        }
-        if (r.source_total > 0) {
-          details.push(`${r.source_total} total source states`);
-        }
-        if (r.stats_error) {
-          details.push(`Stats error: ${r.stats_error}`);
-        }
-        const safe = r.states_imported === 0 && r.stats_imported === 0 && !r.stats_error;
+        if (r.states_imported > 0)
+          details.push(`<span><strong>${r.states_imported}</strong> states imported</span>`);
+        if (r.states_already_covered > 0)
+          details.push(`<span>${r.states_already_covered} already covered</span>`);
+        if (r.stats_imported > 0)
+          details.push(`<span><strong>${r.stats_imported}</strong> statistic rows imported</span>`);
+        if (r.source_total > 0)
+          details.push(`<span>${r.source_total} total source states</span>`);
+        if (r.stats_error)
+          details.push(`<span style="color:var(--error-color,#db4437)">Stats error: ${r.stats_error}</span>`);
+
         return `<div class="result-item result-success">
-          <strong>${r.source} \u2192 ${r.destination}</strong><br/>
-          ${safe ? "Nothing to import (already up to date)." : details.join(" | ")}
+          <div class="result-header">
+            <span class="result-icon">${nothingToDo ? "&#9989;" : "&#9989;"}</span>
+            ${pairLabel}
+          </div>
+          <div class="result-details">
+            ${nothingToDo ? "Nothing to import (already up to date)." : details.join("")}
+          </div>
         </div>`;
       })
       .join("");

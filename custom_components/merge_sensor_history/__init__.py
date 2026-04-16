@@ -28,8 +28,12 @@ from homeassistant.components.recorder.statistics import (
 from homeassistant.components.recorder.models import (
     StatisticData,
     StatisticMetaData,
-    StatisticMeanType,
 )
+
+try:
+    from homeassistant.components.recorder.models import StatisticMeanType
+except ImportError:
+    StatisticMeanType = None  # type: ignore[assignment,misc]
 from homeassistant.components.recorder.db_schema import (
     States,
     StateAttributes,
@@ -510,20 +514,17 @@ async def _async_import_statistics_for_pair(
     """
     recorder = get_instance(hass)
 
-    try:
-        source_stats = await recorder.async_add_executor_job(
-            partial(
-                statistics_during_period,
-                hass,
-                _EPOCH,
-                statistic_ids={source_id},
-                period="hour",
-                types={"mean", "min", "max", "sum", "state", "last_reset"},
-            )
+    source_stats = await recorder.async_add_executor_job(
+        partial(
+            statistics_during_period,
+            hass,
+            _EPOCH,
+            None,  # end_time — explicit positional to avoid ambiguity
+            statistic_ids={source_id},
+            period="hour",
+            types={"mean", "min", "max", "sum", "state"},
         )
-    except Exception:
-        _LOGGER.debug("Could not read statistics for %s", source_id, exc_info=True)
-        return 0
+    )
 
     stat_rows = source_stats.get(source_id, [])
     if not stat_rows:
@@ -544,8 +545,6 @@ async def _async_import_statistics_for_pair(
 
     has_sum = any(r.get("sum") is not None for r in stat_rows)
     has_mean = any(r.get("mean") is not None for r in stat_rows)
-
-    mean_type = StatisticMeanType.ARITHMETIC if has_mean else StatisticMeanType.NONE
 
     unit_class_map = {
         "temperature": "temperature",
@@ -568,20 +567,28 @@ async def _async_import_statistics_for_pair(
     }
     unit_class = unit_class_map.get(device_class) if device_class else None
 
-    metadata = StatisticMetaData(
-        has_sum=has_sum,
-        mean_type=mean_type,
-        name=None,
-        source="recorder",
-        statistic_id=dest_id,
-        unit_class=unit_class,
-        unit_of_measurement=unit,
-    )
+    # Build metadata — handle both old (has_mean: bool) and new (mean_type)
+    # HA API versions.
+    meta_kwargs: dict[str, Any] = {
+        "has_sum": has_sum,
+        "name": None,
+        "source": "recorder",
+        "statistic_id": dest_id,
+        "unit_class": unit_class,
+        "unit_of_measurement": unit,
+    }
+    if StatisticMeanType is not None:
+        meta_kwargs["mean_type"] = (
+            StatisticMeanType.ARITHMETIC if has_mean else StatisticMeanType.NONE
+        )
+    else:
+        meta_kwargs["has_mean"] = has_mean
+    metadata = StatisticMetaData(**meta_kwargs)
 
     stats_data = []
     for row in stat_rows:
         entry: dict[str, Any] = {"start": row["start"]}
-        for key in ("mean", "min", "max", "sum", "state", "last_reset"):
+        for key in ("mean", "min", "max", "sum", "state"):
             if row.get(key) is not None:
                 entry[key] = row[key]
         stats_data.append(StatisticData(**entry))
