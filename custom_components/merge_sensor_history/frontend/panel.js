@@ -319,6 +319,13 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           grid-column: 1 / -1;
           margin-top: 4px;
         }
+        .result-stat-range {
+          color: var(--secondary-text-color);
+          font-size: 12px;
+          font-style: italic;
+          margin-top: 2px;
+          padding-top: 2px;
+        }
         .spinner {
           display: inline-block;
           width: 16px;
@@ -761,6 +768,33 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     }
   }
 
+  /** Format an ISO datetime string for display. Returns "" if null. */
+  _formatTs(iso) {
+    if (!iso) return "";
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    return d.toLocaleString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+
+  /** Format a signed numeric offset with a unit for display. */
+  _formatOffset(offset, unit) {
+    if (offset === null || offset === undefined) return "";
+    const abs = Math.abs(offset);
+    // Use sensible precision: more decimals for small numbers, fewer for large.
+    let formatted;
+    if (abs >= 1000) formatted = abs.toLocaleString(undefined, { maximumFractionDigits: 2 });
+    else if (abs >= 1) formatted = abs.toLocaleString(undefined, { maximumFractionDigits: 3 });
+    else formatted = abs.toLocaleString(undefined, { maximumFractionDigits: 6 });
+    const sign = offset >= 0 ? "+" : "\u2212";
+    return unit ? `${sign}${formatted} ${unit}` : `${sign}${formatted}`;
+  }
+
   _renderResults(results) {
     this._resultsContainer.innerHTML = results
       .map((r) => {
@@ -797,19 +831,40 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         }
 
         let grid = "";
-        // States summary
-        if (r.source_total > 0) {
+
+        // --- States summary ---
+        if (r.states_source_total > 0) {
           grid += `<span class="result-stat-label">States</span><span class="result-stat-label"></span>`;
-          grid += `<span class="result-stat-value">${r.source_total.toLocaleString()}</span><span class="result-stat-label">total in source</span>`;
+          grid += `<span class="result-stat-value">${r.states_source_total.toLocaleString()}</span><span class="result-stat-label">total in source</span>`;
           if (r.states_already_covered > 0)
             grid += `<span class="result-stat-value">${r.states_already_covered.toLocaleString()}</span><span class="result-stat-label">already present in destination</span>`;
           grid += `<span class="result-stat-value">${r.states_imported.toLocaleString()}</span><span class="result-stat-label">imported</span>`;
+          if (r.states_imported_start && r.states_imported_end) {
+            const range = `${this._formatTs(r.states_imported_start)} \u2192 ${this._formatTs(r.states_imported_end)}`;
+            grid += `<span class="result-stat-range" style="grid-column:1/-1">${range}</span>`;
+          }
         }
-        // Statistics summary
-        if (r.stats_imported > 0 || r.stats_error) {
-          grid += `<span class="result-stat-label" style="margin-top:6px">Statistics</span><span class="result-stat-label"></span>`;
-          if (r.stats_imported > 0)
-            grid += `<span class="result-stat-value">${r.stats_imported.toLocaleString()}</span><span class="result-stat-label">long-term statistic rows imported</span>`;
+
+        // --- Statistics summary ---
+        const hasStatsInfo =
+          r.stats_source_total > 0 || r.stats_imported > 0 || r.stats_error;
+        if (hasStatsInfo) {
+          grid += `<span class="result-stat-label" style="margin-top:6px">Long-term statistics (hourly)</span><span class="result-stat-label"></span>`;
+          if (r.stats_source_total > 0)
+            grid += `<span class="result-stat-value">${r.stats_source_total.toLocaleString()}</span><span class="result-stat-label">total in source</span>`;
+          if (r.stats_already_covered > 0)
+            grid += `<span class="result-stat-value">${r.stats_already_covered.toLocaleString()}</span><span class="result-stat-label">already present in destination</span>`;
+          if (r.stats_skipped_recent > 0)
+            grid += `<span class="result-stat-value">${r.stats_skipped_recent.toLocaleString()}</span><span class="result-stat-label">skipped (recent &mdash; not yet compiled by HA)</span>`;
+          grid += `<span class="result-stat-value">${(r.stats_imported || 0).toLocaleString()}</span><span class="result-stat-label">imported</span>`;
+          if (r.stats_imported_start && r.stats_imported_end) {
+            const range = `${this._formatTs(r.stats_imported_start)} \u2192 ${this._formatTs(r.stats_imported_end)}`;
+            grid += `<span class="result-stat-range" style="grid-column:1/-1">${range}</span>`;
+          }
+          if (r.stats_sum_offset !== null && r.stats_sum_offset !== undefined) {
+            const offsetStr = this._formatOffset(r.stats_sum_offset, r.stats_unit);
+            grid += `<span class="result-stat-range" style="grid-column:1/-1">Cumulative-sum offset applied: <strong>${offsetStr}</strong> (aligns energy totals at splice point)</span>`;
+          }
           if (r.stats_error)
             grid += `<span class="result-stat-error">Error: ${r.stats_error}</span>`;
         }
