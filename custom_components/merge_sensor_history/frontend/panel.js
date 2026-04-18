@@ -817,16 +817,18 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           </div>`;
         }
 
-        const nothingToDo =
+        const nothingImported =
           r.states_imported === 0 && r.stats_imported === 0 && !r.stats_error;
+        const noSourceData =
+          (r.states_source_total || 0) === 0 && (r.stats_source_total || 0) === 0;
 
-        if (nothingToDo) {
+        if (nothingImported && noSourceData) {
           return `<div class="result-item result-success">
             <div class="result-header">
               <span class="result-icon">&#9989;</span>
               ${pairLabel}
             </div>
-            <div class="result-details">Already up to date &mdash; nothing to import.</div>
+            <div class="result-details">No source data found &mdash; nothing to import.</div>
           </div>`;
         }
 
@@ -846,6 +848,9 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         }
 
         // --- Statistics summary ---
+        // Always show this section if source has any stats data, even when
+        // nothing was imported — the user needs to see WHY (e.g. all rows
+        // already complete, or skipped as too recent).
         const hasStatsInfo =
           r.stats_source_total > 0 || r.stats_imported > 0 || r.stats_error;
         if (hasStatsInfo) {
@@ -853,10 +858,12 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           if (r.stats_source_total > 0)
             grid += `<span class="result-stat-value">${r.stats_source_total.toLocaleString()}</span><span class="result-stat-label">total in source</span>`;
           if (r.stats_already_covered > 0)
-            grid += `<span class="result-stat-value">${r.stats_already_covered.toLocaleString()}</span><span class="result-stat-label">already present in destination</span>`;
+            grid += `<span class="result-stat-value">${r.stats_already_covered.toLocaleString()}</span><span class="result-stat-label">already complete in destination</span>`;
+          if (r.stats_gap_filled > 0)
+            grid += `<span class="result-stat-value">${r.stats_gap_filled.toLocaleString()}</span><span class="result-stat-label">gap-filled (NULL columns in destination)</span>`;
           if (r.stats_skipped_recent > 0)
             grid += `<span class="result-stat-value">${r.stats_skipped_recent.toLocaleString()}</span><span class="result-stat-label">skipped (recent &mdash; not yet compiled by HA)</span>`;
-          grid += `<span class="result-stat-value">${(r.stats_imported || 0).toLocaleString()}</span><span class="result-stat-label">imported</span>`;
+          grid += `<span class="result-stat-value">${(r.stats_imported || 0).toLocaleString()}</span><span class="result-stat-label">total imported</span>`;
           if (r.stats_imported_start && r.stats_imported_end) {
             const range = `${this._formatTs(r.stats_imported_start)} \u2192 ${this._formatTs(r.stats_imported_end)}`;
             grid += `<span class="result-stat-range" style="grid-column:1/-1">${range}</span>`;

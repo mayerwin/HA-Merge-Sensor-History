@@ -630,6 +630,7 @@ async def _async_import_statistics_for_pair(
         "stats_imported": 0,
         "stats_already_covered": 0,
         "stats_skipped_recent": 0,
+        "stats_gap_filled": 0,  # hours where dest had a row but NULL in some column source provides
         "stats_imported_start": None,
         "stats_imported_end": None,
         "stats_sum_offset": None,
@@ -668,26 +669,72 @@ async def _async_import_statistics_for_pair(
     # -- Compute sum offset (None if not applicable) --
     sum_offset = _compute_sum_offset(source_rows, dest_rows)
 
-    # -- Build set of destination start_ts already covered --
-    dest_starts = {_row_start_ts(r) for r in dest_rows}
+    # -- Build destination row lookup by start_ts --
+    # IMPORTANT: a row existing at a given hour does NOT mean it's "covered".
+    # It may have NULL for columns the user cares about (e.g. sum=NULL on an
+    # energy sensor that lost its totalizer reading), which shows up as a
+    # visual gap in the dashboard. We detect those per-column and merge.
+    dest_by_start: dict[float, dict] = {_row_start_ts(r): r for r in dest_rows}
 
-    # -- Partition source rows: import / skip-covered / skip-recent --
-    to_import_rows: list[dict] = []
+    stat_cols = ("mean", "min", "max", "sum", "state")
+
+    # -- Partition source rows: import / merge / skip-covered / skip-recent --
+    # Each entry in to_import_rows is (start_ts, data_dict) — the full row to
+    # pass to async_import_statistics. For merge cases, data_dict starts with
+    # the destination's existing non-NULL values to avoid wiping them (because
+    # HA's _update_statistics uses .get() for every column — omitting a column
+    # sets it to NULL in the DB).
+    to_import_rows: list[tuple[float, dict[str, Any]]] = []
     already_covered = 0
     skipped_recent = 0
+    gap_filled = 0
 
-    for row in source_rows:
-        start_ts = _row_start_ts(row)
+    for src_row in source_rows:
+        start_ts = _row_start_ts(src_row)
         if start_ts > recent_cutoff_ts:
             skipped_recent += 1
             continue
-        if start_ts in dest_starts:
+
+        src_values = {k: src_row[k] for k in stat_cols if src_row.get(k) is not None}
+        if not src_values:
+            # Source has a row for this hour but nothing useful in it.
             already_covered += 1
             continue
-        to_import_rows.append(row)
+
+        dest_row = dest_by_start.get(start_ts)
+
+        if dest_row is None:
+            # No destination row: insert all source values (with sum offset).
+            data = dict(src_values)
+            if "sum" in data and sum_offset is not None:
+                data["sum"] = float(data["sum"]) + sum_offset
+            to_import_rows.append((start_ts, data))
+            continue
+
+        dest_values = {k: dest_row[k] for k in stat_cols if dest_row.get(k) is not None}
+        fillable = {k: v for k, v in src_values.items() if k not in dest_values}
+
+        if not fillable:
+            # Destination already has non-NULL values for every column source
+            # provides — nothing to fill.
+            already_covered += 1
+            continue
+
+        # Merge: start with dest's non-NULL values (to preserve them against
+        # _update_statistics' full-column overwrite), then layer source's
+        # fills for the NULL columns.
+        data = dict(dest_values)
+        for k, v in fillable.items():
+            if k == "sum" and sum_offset is not None:
+                v = float(v) + sum_offset
+            data[k] = v
+
+        to_import_rows.append((start_ts, data))
+        gap_filled += 1
 
     out["stats_already_covered"] = already_covered
     out["stats_skipped_recent"] = skipped_recent
+    out["stats_gap_filled"] = gap_filled
 
     if not to_import_rows:
         if sum_offset is not None:
@@ -732,22 +779,23 @@ async def _async_import_statistics_for_pair(
 
     out["stats_unit"] = unit
 
-    # -- Build StatisticData entries (with sum offset applied if present) --
+    # -- Build StatisticData entries --
+    # data dicts already have sum_offset applied (during merge/partition) and
+    # already include destination's existing non-NULL columns when merging, so
+    # _update_statistics' full-column overwrite won't wipe them.
     stats_data = []
-    for row in to_import_rows:
-        start_dt = datetime.fromtimestamp(_row_start_ts(row), tz=timezone.utc)
+    for start_ts, data in to_import_rows:
+        start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
         entry: dict[str, Any] = {"start": start_dt}
-        for key in ("mean", "min", "max", "state"):
-            if row.get(key) is not None:
-                entry[key] = row[key]
-        if row.get("sum") is not None:
-            entry["sum"] = float(row["sum"]) + (sum_offset or 0.0)
+        for key in ("mean", "min", "max", "sum", "state"):
+            if key in data:
+                entry[key] = data[key]
         stats_data.append(StatisticData(**entry))
 
     # -- Queue the import (fire-and-forget on the recorder thread) --
     async_import_statistics(hass, metadata, stats_data)
 
-    imported_starts = sorted(_row_start_ts(r) for r in to_import_rows)
+    imported_starts = sorted(start_ts for start_ts, _ in to_import_rows)
     out["stats_imported"] = len(stats_data)
     out["stats_imported_start"] = datetime.fromtimestamp(
         imported_starts[0], tz=timezone.utc
@@ -760,11 +808,12 @@ async def _async_import_statistics_for_pair(
 
     _LOGGER.info(
         "Queued %d statistics rows for %s "
-        "(%d already present in destination, %d skipped as too recent, "
-        "sum offset: %s)",
+        "(%d already complete in destination, %d gap-filled (NULL columns), "
+        "%d skipped as too recent, sum offset: %s)",
         len(stats_data),
         dest_id,
         already_covered,
+        gap_filled,
         skipped_recent,
         sum_offset,
     )
