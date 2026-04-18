@@ -40,6 +40,7 @@ from homeassistant.components.recorder.db_schema import (
     States,
     StateAttributes,
     StatesMeta,
+    StatisticsShortTerm,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
@@ -91,7 +92,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def handle_import_history(call: ServiceCall) -> None:
         source = call.data["source_entity_id"]
         dest = call.data["destination_entity_id"]
-        result = await _async_import_pair(hass, source, dest)
+        fill_gaps = bool(call.data.get("fill_gaps", False))
+        gap_threshold_minutes = int(call.data.get("gap_threshold_minutes", 60))
+        result = await _async_import_pair(
+            hass,
+            source,
+            dest,
+            fill_gaps=fill_gaps,
+            gap_threshold_minutes=gap_threshold_minutes,
+        )
         if result["error"]:
             _LOGGER.error(
                 "Import from %s to %s failed: %s", source, dest, result["error"]
@@ -113,6 +122,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             {
                 vol.Required("source_entity_id"): cv.entity_id,
                 vol.Required("destination_entity_id"): cv.entity_id,
+                vol.Optional("fill_gaps", default=False): cv.boolean,
+                vol.Optional("gap_threshold_minutes", default=60): vol.All(
+                    vol.Coerce(int), vol.Range(min=1, max=1440)
+                ),
             }
         ),
     )
@@ -144,6 +157,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 }
             )
         ],
+        vol.Optional("fill_gaps", default=False): bool,
+        vol.Optional("gap_threshold_minutes", default=60): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=1440)
+        ),
     }
 )
 @websocket_api.async_response
@@ -152,10 +169,18 @@ async def ws_import_history(
 ) -> None:
     """Handle import request from the panel."""
     pairs = msg["pairs"]
+    fill_gaps = bool(msg.get("fill_gaps", False))
+    gap_threshold_minutes = int(msg.get("gap_threshold_minutes", 60))
     results = []
 
     for pair in pairs:
-        result = await _async_import_pair(hass, pair["source"], pair["destination"])
+        result = await _async_import_pair(
+            hass,
+            pair["source"],
+            pair["destination"],
+            fill_gaps=fill_gaps,
+            gap_threshold_minutes=gap_threshold_minutes,
+        )
         results.append(
             {
                 "source": pair["source"],
@@ -184,19 +209,33 @@ async def ws_get_status(
 
 
 async def _async_import_pair(
-    hass: HomeAssistant, source_id: str, dest_id: str
+    hass: HomeAssistant,
+    source_id: str,
+    dest_id: str,
+    *,
+    fill_gaps: bool = False,
+    gap_threshold_minutes: int = 60,
 ) -> dict[str, Any]:
     """Import all history from source entity into destination entity.
 
     This function is IDEMPOTENT:
     - It only imports source states strictly older than the destination's
-      oldest entry.
+      oldest entry (unless `fill_gaps` is set, which also fills mid-stream
+      and trailing gaps in the destination's state history).
     - The state insertion is ATOMIC (single transaction): either all states
       are committed, or none are (full rollback).
     - Re-running after success: destination now has older data, so the cutoff
       moves earlier and nothing new qualifies. Zero states imported.
     - Re-running after failure: the rollback left the DB unchanged, so the
       same states qualify and are imported from scratch.
+
+    When `fill_gaps` is True, also:
+    - Imports source states falling inside any gap in the destination's
+      existing state history where the gap width is >= `gap_threshold_minutes`.
+    - Imports source states newer than the destination's newest state if
+      (now - dest_newest) >= `gap_threshold_minutes`.
+    - Backfills short-term statistics for hours/5-min slots where the
+      destination has no short-term stats row.
 
     Returns a dict with result details for the UI.
     """
@@ -205,17 +244,27 @@ async def _async_import_pair(
         "states_source_total": 0,
         "states_imported": 0,
         "states_already_covered": 0,
+        "states_mid_stream_filled": 0,  # source states imported inside dest-range gaps
+        "states_trailing_filled": 0,  # source states imported after dest's newest
         "states_imported_start": None,  # ISO datetime of first imported state
         "states_imported_end": None,  # ISO datetime of last imported state
-        # Statistics
+        # Long-term statistics (hourly)
         "stats_source_total": 0,
         "stats_imported": 0,
         "stats_already_covered": 0,
         "stats_skipped_recent": 0,
+        "stats_gap_filled": 0,
         "stats_imported_start": None,  # ISO datetime (hour start) of first imported stat
         "stats_imported_end": None,  # ISO datetime (hour start) of last imported stat
         "stats_sum_offset": None,  # Applied offset value (or None)
         "stats_unit": None,  # Unit of measurement for display
+        # Short-term statistics (5-minute) — populated only when fill_gaps=True
+        "stats_short_source_total": 0,
+        "stats_short_imported": 0,
+        "stats_short_already_covered": 0,
+        "stats_short_skipped_recent": 0,
+        "stats_short_imported_start": None,
+        "stats_short_imported_end": None,
         "error": None,
     }
 
@@ -238,7 +287,14 @@ async def _async_import_pair(
 
     async with locks[dest_id]:
         try:
-            await _do_import(hass, source_id, dest_id, result)
+            await _do_import(
+                hass,
+                source_id,
+                dest_id,
+                result,
+                fill_gaps=fill_gaps,
+                gap_threshold_minutes=gap_threshold_minutes,
+            )
         except Exception as exc:
             _LOGGER.exception(
                 "Error importing history from %s to %s", source_id, dest_id
@@ -253,6 +309,9 @@ async def _do_import(
     source_id: str,
     dest_id: str,
     result: dict[str, Any],
+    *,
+    fill_gaps: bool = False,
+    gap_threshold_minutes: int = 60,
 ) -> None:
     """Execute the actual import. Separated for clean lock/error handling."""
     recorder = get_instance(hass)
@@ -297,14 +356,25 @@ async def _do_import(
     (
         imported,
         already_covered,
+        mid_stream_filled,
+        trailing_filled,
         _cutoff_ts,
         imported_min_ts,
         imported_max_ts,
     ) = await recorder.async_add_executor_job(
-        _insert_states_atomic, recorder, dest_id, source_states
+        partial(
+            _insert_states_atomic,
+            recorder,
+            dest_id,
+            source_states,
+            fill_gaps=fill_gaps,
+            gap_threshold_minutes=gap_threshold_minutes,
+        )
     )
     result["states_imported"] = imported
     result["states_already_covered"] = already_covered
+    result["states_mid_stream_filled"] = mid_stream_filled
+    result["states_trailing_filled"] = trailing_filled
     if imported_min_ts is not None:
         result["states_imported_start"] = datetime.fromtimestamp(
             imported_min_ts, tz=timezone.utc
@@ -337,28 +407,69 @@ async def _do_import(
         )
         result["stats_error"] = str(exc)
 
+    # --- 4. Optionally backfill short-term statistics (5-min) ---
+    # Short-term stats are what HA's graphs render for recent data (< ~10 days).
+    # We only do this when the user opts in via fill_gaps, because short-term
+    # cells are dense (12/hour) and the 5-min compile cycle makes the race
+    # window tighter than for hourly LTS.
+    if fill_gaps:
+        try:
+            short_result = await _async_import_short_term_statistics_for_pair(
+                hass,
+                source_id,
+                dest_id,
+                gap_threshold_minutes=gap_threshold_minutes,
+            )
+            result.update(short_result)
+        except Exception as exc:
+            _LOGGER.warning(
+                "Short-term statistics backfill failed for %s -> %s: %s",
+                source_id,
+                dest_id,
+                exc,
+            )
+            result["stats_short_error"] = str(exc)
+
 
 def _insert_states_atomic(
     recorder_instance: Any,
     dest_entity_id: str,
     source_states: list,
-) -> tuple[int, int, float | None, float | None, float | None]:
+    *,
+    fill_gaps: bool = False,
+    gap_threshold_minutes: int = 60,
+) -> tuple[int, int, int, int, float | None, float | None, float | None]:
     """Insert State objects into the recorder database for a destination entity.
 
     This function is ATOMIC: either ALL states are committed, or NONE are
     (full rollback on any error).
 
-    Idempotency comes from the cutoff rule: only source states strictly older
-    than the destination's oldest existing entry are imported. After a successful
-    import, the destination's oldest entry IS one of the imported states, so a
-    re-run will find nothing new to import.
+    Import rules:
+    - **Head fill (always):** any source state strictly older than the
+      destination's oldest existing entry is imported.
+    - **Mid-stream fill (when `fill_gaps` is True):** for each pair of adjacent
+      destination state timestamps whose delta is >= `gap_threshold_minutes`,
+      import all source states strictly between them.
+    - **Trailing fill (when `fill_gaps` is True):** if (now - destination_max_ts)
+      is >= `gap_threshold_minutes`, import all source states strictly newer
+      than the destination's newest entry.
 
-    Returns (inserted_count, already_covered_count, cutoff_ts, imported_min_ts,
-    imported_max_ts). The last two are None if nothing was imported.
+    Deduplication: source states whose `last_updated` timestamp exactly matches
+    an existing destination timestamp are skipped (prevents introducing
+    same-timestamp twins).
+
+    Idempotency: head-fill moves the cutoff earlier on re-run; gap-fill modes
+    close the gaps they fill, so a re-run sees the same (or no remaining) gaps.
+
+    Returns (inserted_count, already_covered_count, mid_stream_filled_count,
+    trailing_filled_count, cutoff_ts, imported_min_ts, imported_max_ts).
+    The last two are None if nothing was imported.
     """
     inserted = 0
     imported_min_ts: float | None = None
     imported_max_ts: float | None = None
+    mid_stream_filled = 0
+    trailing_filled = 0
     session = recorder_instance.get_session()
 
     try:
@@ -384,34 +495,104 @@ def _insert_states_atomic(
             .scalar()
         )
 
-        # -- Filter source states by cutoff --
-        if min_ts is not None:
-            # Convert to datetime for consistent comparison (avoids float
-            # precision issues from the datetime→float→datetime roundtrip).
-            cutoff_dt = datetime.fromtimestamp(min_ts, tz=timezone.utc)
-            to_import = [s for s in source_states if s.last_updated < cutoff_dt]
-            _LOGGER.info(
-                "Destination %s oldest entry: %s — importing %d of %d source states",
-                dest_entity_id,
-                cutoff_dt.isoformat(),
-                len(to_import),
-                len(source_states),
-            )
-        else:
-            to_import = source_states
+        # -- Decide which source states to import --
+        if min_ts is None:
+            # No destination history: import everything, no gap logic needed.
+            to_import = list(source_states)
             _LOGGER.info(
                 "Destination %s has no history — importing all %d source states",
                 dest_entity_id,
+                len(source_states),
+            )
+        else:
+            cutoff_dt = datetime.fromtimestamp(min_ts, tz=timezone.utc)
+
+            # Head fill: strictly older than destination's oldest.
+            head = [s for s in source_states if s.last_updated < cutoff_dt]
+
+            mid_stream: list = []
+            trailing: list = []
+
+            if fill_gaps:
+                # Load every destination timestamp for this entity (ordered).
+                dest_ts_rows = (
+                    session.query(States.last_updated_ts)
+                    .filter(States.metadata_id == metadata_id)
+                    .order_by(States.last_updated_ts.asc())
+                    .all()
+                )
+                dest_ts_list = [row[0] for row in dest_ts_rows]
+                dest_ts_set = set(dest_ts_list)
+
+                threshold_sec = gap_threshold_minutes * 60.0
+
+                # Mid-stream: intervals between consecutive dest timestamps
+                # whose delta exceeds the threshold.
+                gap_intervals: list[tuple[float, float]] = []
+                for i in range(len(dest_ts_list) - 1):
+                    prev_ts = dest_ts_list[i]
+                    next_ts = dest_ts_list[i + 1]
+                    if (next_ts - prev_ts) >= threshold_sec:
+                        gap_intervals.append((prev_ts, next_ts))
+
+                if gap_intervals:
+                    # Source states are sorted chronologically; scan once.
+                    gi = 0
+                    for s in source_states:
+                        ts = s.last_updated.timestamp()
+                        # Advance to the first interval whose upper bound is > ts.
+                        while gi < len(gap_intervals) and gap_intervals[gi][1] <= ts:
+                            gi += 1
+                        if gi >= len(gap_intervals):
+                            break
+                        lo, hi = gap_intervals[gi]
+                        if lo < ts < hi and ts not in dest_ts_set:
+                            mid_stream.append(s)
+
+                # Trailing: states strictly newer than dest's newest, if the
+                # gap from there to now() meets the threshold.
+                if dest_ts_list:
+                    dest_max_ts = dest_ts_list[-1]
+                    now_ts = datetime.now(timezone.utc).timestamp()
+                    if (now_ts - dest_max_ts) >= threshold_sec:
+                        for s in source_states:
+                            ts = s.last_updated.timestamp()
+                            if ts > dest_max_ts and ts not in dest_ts_set:
+                                trailing.append(s)
+
+            to_import = head + mid_stream + trailing
+            mid_stream_filled = len(mid_stream)
+            trailing_filled = len(trailing)
+
+            _LOGGER.info(
+                "Destination %s oldest entry: %s — head: %d, mid-stream: %d, "
+                "trailing: %d (fill_gaps=%s, threshold=%dmin, %d source states)",
+                dest_entity_id,
+                cutoff_dt.isoformat(),
+                len(head),
+                mid_stream_filled,
+                trailing_filled,
+                fill_gaps,
+                gap_threshold_minutes,
                 len(source_states),
             )
 
         already_covered = len(source_states) - len(to_import)
 
         if not to_import:
-            return 0, already_covered, min_ts, None, None
+            return (
+                0,
+                already_covered,
+                mid_stream_filled,
+                trailing_filled,
+                min_ts,
+                None,
+                None,
+            )
 
-        # source_states comes from get_significant_states in chronological order,
-        # so to_import[0] is oldest and to_import[-1] is newest.
+        # Ensure to_import is sorted chronologically for min/max and a stable
+        # FK-friendly insertion order (head is oldest, then mid-stream, then
+        # trailing — all already sorted within each group and disjoint).
         imported_min_ts = to_import[0].last_updated.timestamp()
         imported_max_ts = to_import[-1].last_updated.timestamp()
 
@@ -488,7 +669,15 @@ def _insert_states_atomic(
     finally:
         session.close()
 
-    return inserted, already_covered, min_ts, imported_min_ts, imported_max_ts
+    return (
+        inserted,
+        already_covered,
+        mid_stream_filled,
+        trailing_filled,
+        min_ts,
+        imported_min_ts,
+        imported_max_ts,
+    )
 
 
 def _get_or_create_attributes(
@@ -846,3 +1035,229 @@ def _fetch_stats_snapshot(
     )
     dest_metadata = get_metadata(hass, statistic_ids={dest_id})
     return source_stats, dest_stats, dest_metadata
+
+
+def _fetch_short_term_stats_snapshot(
+    hass: HomeAssistant, source_id: str, dest_id: str
+) -> tuple[dict, dict, dict]:
+    """Fetch short-term (5-minute) source and destination stats + dest metadata."""
+    types = {"mean", "min", "max", "sum", "state"}
+    source_stats = statistics_during_period(
+        hass,
+        _EPOCH,
+        None,
+        statistic_ids={source_id},
+        period="5minute",
+        units=None,
+        types=types,
+    )
+    dest_stats = statistics_during_period(
+        hass,
+        _EPOCH,
+        None,
+        statistic_ids={dest_id},
+        period="5minute",
+        units=None,
+        types=types,
+    )
+    dest_metadata = get_metadata(hass, statistic_ids={dest_id})
+    return source_stats, dest_stats, dest_metadata
+
+
+async def _async_import_short_term_statistics_for_pair(
+    hass: HomeAssistant,
+    source_id: str,
+    dest_id: str,
+    *,
+    gap_threshold_minutes: int,
+) -> dict[str, Any]:
+    """Backfill short-term (5-minute) statistics from source to destination.
+
+    Opt-in via the `fill_gaps` flag. Behaviors:
+
+    1. **Gap-fill, not overwrite.** Only inserts for 5-min slots where the
+       destination has no existing short-term row, using the same column-merge
+       semantics as the LTS path to avoid nulling out existing columns.
+
+    2. **Tight recent-slot cutoff.** HA's 5-min compile runs at HH:MM:10 UTC
+       (MM in {0,5,…,55}) and writes the just-finished 5-min slot. To stay
+       well clear of an in-flight compile, we skip the most recent two 5-min
+       boundaries: only slots ending <= floor_5min(now) - 10min are considered.
+
+    3. **Trailing-edge threshold.** Source rows newer than the destination's
+       newest short-term row are only imported if (now - dest_newest) >=
+       `gap_threshold_minutes`. Mid-stream missing slots are always filled
+       (bounded by the recent-cutoff rule).
+
+    4. **Cumulative-sum offset for energy sensors.** Reuses the same splice-
+       point offset the LTS path computes.
+
+    5. **Preserve existing destination metadata.** Same reasoning as LTS.
+
+    Returns a dict with `stats_short_*` fields.
+    """
+    recorder = get_instance(hass)
+
+    out: dict[str, Any] = {
+        "stats_short_source_total": 0,
+        "stats_short_imported": 0,
+        "stats_short_already_covered": 0,
+        "stats_short_skipped_recent": 0,
+        "stats_short_imported_start": None,
+        "stats_short_imported_end": None,
+    }
+
+    # -- Recent-slot cutoff: floor_5min(now) - 10 min --
+    now = datetime.now(timezone.utc)
+    floor_5min = now.replace(
+        minute=(now.minute // 5) * 5, second=0, microsecond=0
+    )
+    recent_cutoff_dt = floor_5min - timedelta(minutes=10)
+    recent_cutoff_ts = recent_cutoff_dt.timestamp()
+
+    source_stats_raw, dest_stats_raw, dest_metadata_map = (
+        await recorder.async_add_executor_job(
+            _fetch_short_term_stats_snapshot, hass, source_id, dest_id
+        )
+    )
+
+    source_rows = source_stats_raw.get(source_id, [])
+    dest_rows = dest_stats_raw.get(dest_id, [])
+
+    out["stats_short_source_total"] = len(source_rows)
+    if not source_rows:
+        return out
+
+    # -- Reuse LTS splice-offset logic (works identically on 5-min rows) --
+    sum_offset = _compute_sum_offset(source_rows, dest_rows)
+
+    dest_by_start: dict[float, dict] = {_row_start_ts(r): r for r in dest_rows}
+
+    # Trailing-edge threshold: only fill slots after dest_max_ts if the gap
+    # from there to now() meets the user's threshold.
+    threshold_sec = gap_threshold_minutes * 60.0
+    dest_max_ts: float | None = None
+    trailing_allowed = True
+    if dest_rows:
+        dest_max_ts = max(_row_start_ts(r) for r in dest_rows)
+        trailing_allowed = (now.timestamp() - dest_max_ts) >= threshold_sec
+
+    stat_cols = ("mean", "min", "max", "sum", "state")
+
+    to_import_rows: list[tuple[float, dict[str, Any]]] = []
+    already_covered = 0
+    skipped_recent = 0
+
+    for src_row in source_rows:
+        start_ts = _row_start_ts(src_row)
+        if start_ts > recent_cutoff_ts:
+            skipped_recent += 1
+            continue
+
+        # Trailing gate: source rows beyond dest's newest are only taken if the
+        # trailing gap meets threshold.
+        if (
+            dest_max_ts is not None
+            and start_ts > dest_max_ts
+            and not trailing_allowed
+        ):
+            skipped_recent += 1
+            continue
+
+        src_values = {k: src_row[k] for k in stat_cols if src_row.get(k) is not None}
+        if not src_values:
+            already_covered += 1
+            continue
+
+        dest_row = dest_by_start.get(start_ts)
+
+        if dest_row is None:
+            data = dict(src_values)
+            if "sum" in data and sum_offset is not None:
+                data["sum"] = float(data["sum"]) + sum_offset
+            to_import_rows.append((start_ts, data))
+            continue
+
+        dest_values = {k: dest_row[k] for k in stat_cols if dest_row.get(k) is not None}
+        fillable = {k: v for k, v in src_values.items() if k not in dest_values}
+        if not fillable:
+            already_covered += 1
+            continue
+
+        data = dict(dest_values)
+        for k, v in fillable.items():
+            if k == "sum" and sum_offset is not None:
+                v = float(v) + sum_offset
+            data[k] = v
+
+        to_import_rows.append((start_ts, data))
+
+    out["stats_short_already_covered"] = already_covered
+    out["stats_short_skipped_recent"] = skipped_recent
+
+    if not to_import_rows:
+        return out
+
+    # -- Resolve metadata (prefer destination's existing) --
+    has_sum = any(r.get("sum") is not None for r in source_rows)
+    has_mean = any(r.get("mean") is not None for r in source_rows)
+
+    dest_meta_entry = dest_metadata_map.get(dest_id) if dest_metadata_map else None
+    existing_metadata = dest_meta_entry[1] if dest_meta_entry else None
+
+    if existing_metadata:
+        metadata = dict(existing_metadata)
+        metadata["statistic_id"] = dest_id
+        metadata["source"] = "recorder"
+    else:
+        state_obj = hass.states.get(dest_id) or hass.states.get(source_id)
+        unit = state_obj.attributes.get("unit_of_measurement") if state_obj else None
+        meta_kwargs: dict[str, Any] = {
+            "has_sum": has_sum,
+            "name": None,
+            "source": "recorder",
+            "statistic_id": dest_id,
+            "unit_of_measurement": unit,
+        }
+        if StatisticMeanType is not None:
+            meta_kwargs["mean_type"] = (
+                StatisticMeanType.ARITHMETIC if has_mean else StatisticMeanType.NONE
+            )
+        else:
+            meta_kwargs["has_mean"] = has_mean
+        metadata = StatisticMetaData(**meta_kwargs)
+
+    # -- Build StatisticData entries --
+    stats_data = []
+    for start_ts, data in to_import_rows:
+        start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+        entry: dict[str, Any] = {"start": start_dt}
+        for key in stat_cols:
+            if key in data:
+                entry[key] = data[key]
+        stats_data.append(StatisticData(**entry))
+
+    # -- Queue via the recorder instance method (accepts a `table` arg) --
+    # This path runs under HA's unique-constraint integrity-error filter and
+    # correctly updates ShortTermStatisticsRunCache — much safer than direct
+    # ORM inserts.
+    recorder.async_import_statistics(metadata, stats_data, StatisticsShortTerm)
+
+    imported_starts = sorted(start_ts for start_ts, _ in to_import_rows)
+    out["stats_short_imported"] = len(stats_data)
+    out["stats_short_imported_start"] = datetime.fromtimestamp(
+        imported_starts[0], tz=timezone.utc
+    ).isoformat()
+    out["stats_short_imported_end"] = datetime.fromtimestamp(
+        imported_starts[-1], tz=timezone.utc
+    ).isoformat()
+
+    _LOGGER.info(
+        "Queued %d short-term (5-min) stats rows for %s "
+        "(%d already complete in destination, %d skipped as too recent)",
+        len(stats_data),
+        dest_id,
+        already_covered,
+        skipped_recent,
+    )
+    return out

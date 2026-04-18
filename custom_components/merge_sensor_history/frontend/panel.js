@@ -431,6 +431,74 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           font-size: 12px;
         }
 
+        .options-section {
+          margin-top: 14px;
+          padding: 14px 16px;
+          border: 1px solid var(--divider-color, #e0e0e0);
+          border-radius: 10px;
+          background: var(--secondary-background-color, #f5f5f5);
+        }
+        .option-row {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          font-size: 13px;
+          flex-wrap: wrap;
+          cursor: pointer;
+        }
+        .option-row input[type="checkbox"] {
+          width: 16px;
+          height: 16px;
+          accent-color: var(--primary-color, #03a9f4);
+          cursor: pointer;
+          margin: 0;
+        }
+        .option-row .option-label {
+          color: var(--primary-text-color);
+          font-weight: 500;
+        }
+        .option-row.sub-row {
+          margin-top: 10px;
+          padding-left: 24px;
+          cursor: default;
+          transition: opacity 0.15s;
+        }
+        .option-row.sub-row.disabled {
+          opacity: 0.5;
+          pointer-events: none;
+        }
+        .option-row.sub-row .option-label {
+          font-weight: 400;
+          color: var(--secondary-text-color);
+        }
+        .option-row input[type="number"] {
+          width: 70px;
+          padding: 6px 8px;
+          border: 1px solid var(--divider-color, #e0e0e0);
+          border-radius: 6px;
+          font-size: 13px;
+          background: var(--ha-card-background, var(--card-background-color, white));
+          color: var(--primary-text-color);
+          box-sizing: border-box;
+        }
+        .option-row input[type="number"]:focus {
+          outline: none;
+          border-color: var(--primary-color, #03a9f4);
+          box-shadow: 0 0 0 1px var(--primary-color, #03a9f4);
+        }
+        .option-row .option-unit {
+          color: var(--secondary-text-color);
+          font-size: 13px;
+        }
+        .option-row .option-hint {
+          color: var(--secondary-text-color);
+          font-size: 12px;
+          flex-basis: 100%;
+          margin-top: 4px;
+          margin-left: 0;
+          line-height: 1.5;
+        }
+
         @media (max-width: 600px) {
           .pair-row {
             flex-direction: column;
@@ -485,6 +553,18 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           </div>
         </div>
         <div id="pairs-container"></div>
+        <div class="options-section">
+          <label class="option-row" title="By default, only data older than the destination's oldest existing entry is imported, to avoid duplicates. Enable this to also fill quiet periods inside the destination's existing time range.">
+            <input type="checkbox" id="fill-gaps-cb" />
+            <span class="option-label">Fill mid-stream gaps in the destination's existing time range</span>
+          </label>
+          <div class="option-row sub-row" id="gap-threshold-row">
+            <span class="option-label">Gap threshold:</span>
+            <input type="number" id="gap-threshold" min="1" max="1440" value="60" />
+            <span class="option-unit">minutes</span>
+            <span class="option-hint">&mdash; a gap is any period this long where the destination has no state but the source does</span>
+          </div>
+        </div>
         <div class="actions">
           <button class="btn btn-secondary" id="add-pair-btn">+ Add Pair</button>
           <div style="flex:1"></div>
@@ -502,6 +582,19 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     this._bulkChevron = shadow.getElementById("bulk-chevron");
     this._bulkTextarea = shadow.getElementById("bulk-textarea");
     this._bulkError = shadow.getElementById("bulk-error");
+    this._fillGapsCb = shadow.getElementById("fill-gaps-cb");
+    this._gapThreshold = shadow.getElementById("gap-threshold");
+    this._gapThresholdRow = shadow.getElementById("gap-threshold-row");
+
+    const syncGapThresholdEnabled = () => {
+      this._gapThresholdRow.classList.toggle(
+        "disabled",
+        !this._fillGapsCb.checked
+      );
+      this._gapThreshold.disabled = !this._fillGapsCb.checked;
+    };
+    syncGapThresholdEnabled();
+    this._fillGapsCb.addEventListener("change", syncGapThresholdEnabled);
 
     shadow.getElementById("add-pair-btn").addEventListener("click", () => {
       this._pairs.push({ source: "", destination: "" });
@@ -720,6 +813,21 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       return;
     }
 
+    const fillGaps = !!this._fillGapsCb.checked;
+    let gapThresholdMinutes = Number(this._gapThreshold.value);
+    if (fillGaps) {
+      if (
+        !Number.isFinite(gapThresholdMinutes) ||
+        gapThresholdMinutes < 1 ||
+        gapThresholdMinutes > 1440
+      ) {
+        alert("Gap threshold must be a number between 1 and 1440 minutes.");
+        return;
+      }
+    } else {
+      gapThresholdMinutes = 60;
+    }
+
     const pairLines = validPairs
       .map((p) => {
         const sn = this._friendlyName(p.source);
@@ -730,10 +838,15 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       })
       .join("\n");
 
+    const gapsLine = fillGaps
+      ? `\n\nMid-stream & trailing gap-fill: ON (threshold ${gapThresholdMinutes} min)`
+      : "";
+
     if (
       !confirm(
         `Import history for ${validPairs.length} pair(s)?\n\n` +
           pairLines +
+          gapsLine +
           "\n\nThis will write to your recorder database."
       )
     ) {
@@ -749,6 +862,8 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       const response = await this._hass.callWS({
         type: "merge_sensor_history/import",
         pairs: validPairs,
+        fill_gaps: fillGaps,
+        gap_threshold_minutes: gapThresholdMinutes,
       });
 
       this._renderResults(response.results);
@@ -818,9 +933,15 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         }
 
         const nothingImported =
-          r.states_imported === 0 && r.stats_imported === 0 && !r.stats_error;
+          r.states_imported === 0 &&
+          r.stats_imported === 0 &&
+          (r.stats_short_imported || 0) === 0 &&
+          !r.stats_error &&
+          !r.stats_short_error;
         const noSourceData =
-          (r.states_source_total || 0) === 0 && (r.stats_source_total || 0) === 0;
+          (r.states_source_total || 0) === 0 &&
+          (r.stats_source_total || 0) === 0 &&
+          (r.stats_short_source_total || 0) === 0;
 
         if (nothingImported && noSourceData) {
           return `<div class="result-item result-success">
@@ -841,6 +962,10 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           if (r.states_already_covered > 0)
             grid += `<span class="result-stat-value">${r.states_already_covered.toLocaleString()}</span><span class="result-stat-label">already present in destination</span>`;
           grid += `<span class="result-stat-value">${r.states_imported.toLocaleString()}</span><span class="result-stat-label">imported</span>`;
+          if (r.states_mid_stream_filled > 0)
+            grid += `<span class="result-stat-value">${r.states_mid_stream_filled.toLocaleString()}</span><span class="result-stat-label">&nbsp;&nbsp;&mdash; mid-stream gap-fill</span>`;
+          if (r.states_trailing_filled > 0)
+            grid += `<span class="result-stat-value">${r.states_trailing_filled.toLocaleString()}</span><span class="result-stat-label">&nbsp;&nbsp;&mdash; trailing fill (past destination's newest)</span>`;
           if (r.states_imported_start && r.states_imported_end) {
             const range = `${this._formatTs(r.states_imported_start)} \u2192 ${this._formatTs(r.states_imported_end)}`;
             grid += `<span class="result-stat-range" style="grid-column:1/-1">${range}</span>`;
@@ -874,6 +999,28 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           }
           if (r.stats_error)
             grid += `<span class="result-stat-error">Error: ${r.stats_error}</span>`;
+        }
+
+        // --- Short-term statistics summary (only shown when backfill ran) ---
+        const hasShortInfo =
+          (r.stats_short_source_total || 0) > 0 ||
+          (r.stats_short_imported || 0) > 0 ||
+          r.stats_short_error;
+        if (hasShortInfo) {
+          grid += `<span class="result-stat-label" style="margin-top:6px">Short-term statistics (5-min)</span><span class="result-stat-label"></span>`;
+          if (r.stats_short_source_total > 0)
+            grid += `<span class="result-stat-value">${r.stats_short_source_total.toLocaleString()}</span><span class="result-stat-label">total in source</span>`;
+          if (r.stats_short_already_covered > 0)
+            grid += `<span class="result-stat-value">${r.stats_short_already_covered.toLocaleString()}</span><span class="result-stat-label">already complete in destination</span>`;
+          if (r.stats_short_skipped_recent > 0)
+            grid += `<span class="result-stat-value">${r.stats_short_skipped_recent.toLocaleString()}</span><span class="result-stat-label">skipped (too recent or under threshold)</span>`;
+          grid += `<span class="result-stat-value">${(r.stats_short_imported || 0).toLocaleString()}</span><span class="result-stat-label">imported</span>`;
+          if (r.stats_short_imported_start && r.stats_short_imported_end) {
+            const range = `${this._formatTs(r.stats_short_imported_start)} \u2192 ${this._formatTs(r.stats_short_imported_end)}`;
+            grid += `<span class="result-stat-range" style="grid-column:1/-1">${range}</span>`;
+          }
+          if (r.stats_short_error)
+            grid += `<span class="result-stat-error">Error: ${r.stats_short_error}</span>`;
         }
 
         return `<div class="result-item result-success">
