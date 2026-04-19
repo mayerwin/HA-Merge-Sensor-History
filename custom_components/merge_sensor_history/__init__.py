@@ -53,6 +53,10 @@ _LOGGER = logging.getLogger(__name__)
 # Epoch used as "beginning of time" for queries
 _EPOCH = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
+# State values that HA hides in the History panel — also excluded from
+# gap-detection so a long unavailable streak registers as a fillable gap.
+_NON_GOOD_STATES = frozenset({"unavailable", "unknown"})
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Merge Sensor History from a config entry."""
@@ -514,24 +518,37 @@ def _insert_states_atomic(
             trailing: list = []
 
             if fill_gaps:
-                # Load every destination timestamp for this entity (ordered).
-                dest_ts_rows = (
-                    session.query(States.last_updated_ts)
+                # Load every destination row's timestamp + state value (ordered).
+                # We need the value to filter "non-good" states (unavailable /
+                # unknown / NULL) out of gap detection: HA hides those in the
+                # History panel so a long unavailable streak LOOKS like a gap,
+                # even though the rows are physically present in the DB. Without
+                # this filter, mid-stream fill never triggers because consecutive
+                # `unavailable` rows are typically only seconds apart.
+                #
+                # `dest_ts_set` (all rows) is still used for exact-timestamp
+                # dedup, so we never insert a twin alongside an unavailable row.
+                dest_rows = (
+                    session.query(States.last_updated_ts, States.state)
                     .filter(States.metadata_id == metadata_id)
                     .order_by(States.last_updated_ts.asc())
                     .all()
                 )
-                dest_ts_list = [row[0] for row in dest_ts_rows]
-                dest_ts_set = set(dest_ts_list)
+                dest_ts_set = {row[0] for row in dest_rows}
+                good_dest_ts_list = [
+                    row[0]
+                    for row in dest_rows
+                    if row[1] is not None and row[1] not in _NON_GOOD_STATES
+                ]
 
                 threshold_sec = gap_threshold_minutes * 60.0
 
-                # Mid-stream: intervals between consecutive dest timestamps
-                # whose delta exceeds the threshold.
+                # Mid-stream: intervals between consecutive *good* dest
+                # timestamps whose delta exceeds the threshold.
                 gap_intervals: list[tuple[float, float]] = []
-                for i in range(len(dest_ts_list) - 1):
-                    prev_ts = dest_ts_list[i]
-                    next_ts = dest_ts_list[i + 1]
+                for i in range(len(good_dest_ts_list) - 1):
+                    prev_ts = good_dest_ts_list[i]
+                    next_ts = good_dest_ts_list[i + 1]
                     if (next_ts - prev_ts) >= threshold_sec:
                         gap_intervals.append((prev_ts, next_ts))
 
@@ -549,15 +566,18 @@ def _insert_states_atomic(
                         if lo < ts < hi and ts not in dest_ts_set:
                             mid_stream.append(s)
 
-                # Trailing: states strictly newer than dest's newest, if the
-                # gap from there to now() meets the threshold.
-                if dest_ts_list:
-                    dest_max_ts = dest_ts_list[-1]
+                # Trailing: states strictly newer than dest's newest *good*
+                # state, if the gap from there to now() meets the threshold.
+                # Using the last good ts (rather than the last raw row) means
+                # a sensor that's currently `unavailable` for >= threshold
+                # qualifies for trailing fill from source.
+                if good_dest_ts_list:
+                    dest_max_good_ts = good_dest_ts_list[-1]
                     now_ts = datetime.now(timezone.utc).timestamp()
-                    if (now_ts - dest_max_ts) >= threshold_sec:
+                    if (now_ts - dest_max_good_ts) >= threshold_sec:
                         for s in source_states:
                             ts = s.last_updated.timestamp()
-                            if ts > dest_max_ts and ts not in dest_ts_set:
+                            if ts > dest_max_good_ts and ts not in dest_ts_set:
                                 trailing.append(s)
 
             to_import = head + mid_stream + trailing
