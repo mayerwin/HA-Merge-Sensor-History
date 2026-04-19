@@ -246,10 +246,14 @@ async def _async_import_pair(
     result: dict[str, Any] = {
         # States
         "states_source_total": 0,
+        "states_source_skipped_non_good": 0,  # unavailable/unknown source rows
         "states_imported": 0,
         "states_already_covered": 0,
         "states_mid_stream_filled": 0,  # source states imported inside dest-range gaps
         "states_trailing_filled": 0,  # source states imported after dest's newest
+        "states_dest_total_rows": 0,  # diagnostic: rows in dest before this import
+        "states_dest_good_rows": 0,  # diagnostic: rows used for gap detection
+        "states_gap_intervals_count": 0,  # diagnostic: # of qualifying gaps detected
         "states_imported_start": None,  # ISO datetime of first imported state
         "states_imported_end": None,  # ISO datetime of last imported state
         # Long-term statistics (hourly)
@@ -362,6 +366,10 @@ async def _do_import(
         already_covered,
         mid_stream_filled,
         trailing_filled,
+        source_skipped_non_good,
+        dest_total_rows,
+        dest_good_rows,
+        gap_intervals_count,
         _cutoff_ts,
         imported_min_ts,
         imported_max_ts,
@@ -379,6 +387,10 @@ async def _do_import(
     result["states_already_covered"] = already_covered
     result["states_mid_stream_filled"] = mid_stream_filled
     result["states_trailing_filled"] = trailing_filled
+    result["states_source_skipped_non_good"] = source_skipped_non_good
+    result["states_dest_total_rows"] = dest_total_rows
+    result["states_dest_good_rows"] = dest_good_rows
+    result["states_gap_intervals_count"] = gap_intervals_count
     if imported_min_ts is not None:
         result["states_imported_start"] = datetime.fromtimestamp(
             imported_min_ts, tz=timezone.utc
@@ -442,7 +454,9 @@ def _insert_states_atomic(
     *,
     fill_gaps: bool = False,
     gap_threshold_minutes: int = 60,
-) -> tuple[int, int, int, int, float | None, float | None, float | None]:
+) -> tuple[
+    int, int, int, int, int, int, int, int, float | None, float | None, float | None
+]:
     """Insert State objects into the recorder database for a destination entity.
 
     This function is ATOMIC: either ALL states are committed, or NONE are
@@ -465,8 +479,9 @@ def _insert_states_atomic(
     Idempotency: head-fill moves the cutoff earlier on re-run; gap-fill modes
     close the gaps they fill, so a re-run sees the same (or no remaining) gaps.
 
-    Returns (inserted_count, already_covered_count, mid_stream_filled_count,
-    trailing_filled_count, cutoff_ts, imported_min_ts, imported_max_ts).
+    Returns (inserted, already_covered, mid_stream_filled, trailing_filled,
+    source_skipped_non_good, dest_total_rows, dest_good_rows,
+    gap_intervals_count, cutoff_ts, imported_min_ts, imported_max_ts).
     The last two are None if nothing was imported.
     """
     inserted = 0
@@ -474,6 +489,10 @@ def _insert_states_atomic(
     imported_max_ts: float | None = None
     mid_stream_filled = 0
     trailing_filled = 0
+    source_skipped_non_good = 0
+    dest_total_rows = 0
+    dest_good_rows = 0
+    gap_intervals_count = 0
     session = recorder_instance.get_session()
 
     try:
@@ -540,6 +559,8 @@ def _insert_states_atomic(
                     for row in dest_rows
                     if row[1] is not None and row[1] not in _NON_GOOD_STATES
                 ]
+                dest_total_rows = len(dest_rows)
+                dest_good_rows = len(good_dest_ts_list)
 
                 threshold_sec = gap_threshold_minutes * 60.0
 
@@ -551,9 +572,12 @@ def _insert_states_atomic(
                     next_ts = good_dest_ts_list[i + 1]
                     if (next_ts - prev_ts) >= threshold_sec:
                         gap_intervals.append((prev_ts, next_ts))
+                gap_intervals_count = len(gap_intervals)
 
                 if gap_intervals:
                     # Source states are sorted chronologically; scan once.
+                    # Skip non-good source states (unavailable/unknown) — they
+                    # would just add another hidden row without closing the gap.
                     gi = 0
                     for s in source_states:
                         ts = s.last_updated.timestamp()
@@ -563,8 +587,14 @@ def _insert_states_atomic(
                         if gi >= len(gap_intervals):
                             break
                         lo, hi = gap_intervals[gi]
-                        if lo < ts < hi and ts not in dest_ts_set:
-                            mid_stream.append(s)
+                        if not (lo < ts < hi):
+                            continue
+                        if ts in dest_ts_set:
+                            continue
+                        if s.state is None or s.state in _NON_GOOD_STATES:
+                            source_skipped_non_good += 1
+                            continue
+                        mid_stream.append(s)
 
                 # Trailing: states strictly newer than dest's newest *good*
                 # state, if the gap from there to now() meets the threshold.
@@ -577,8 +607,12 @@ def _insert_states_atomic(
                     if (now_ts - dest_max_good_ts) >= threshold_sec:
                         for s in source_states:
                             ts = s.last_updated.timestamp()
-                            if ts > dest_max_good_ts and ts not in dest_ts_set:
-                                trailing.append(s)
+                            if ts <= dest_max_good_ts or ts in dest_ts_set:
+                                continue
+                            if s.state is None or s.state in _NON_GOOD_STATES:
+                                source_skipped_non_good += 1
+                                continue
+                            trailing.append(s)
 
             to_import = head + mid_stream + trailing
             mid_stream_filled = len(mid_stream)
@@ -586,15 +620,21 @@ def _insert_states_atomic(
 
             _LOGGER.info(
                 "Destination %s oldest entry: %s — head: %d, mid-stream: %d, "
-                "trailing: %d (fill_gaps=%s, threshold=%dmin, %d source states)",
+                "trailing: %d, source_skipped_non_good: %d "
+                "(fill_gaps=%s, threshold=%dmin, %d source states, "
+                "dest rows: %d total / %d good, %d gap intervals)",
                 dest_entity_id,
                 cutoff_dt.isoformat(),
                 len(head),
                 mid_stream_filled,
                 trailing_filled,
+                source_skipped_non_good,
                 fill_gaps,
                 gap_threshold_minutes,
                 len(source_states),
+                dest_total_rows,
+                dest_good_rows,
+                gap_intervals_count,
             )
 
         already_covered = len(source_states) - len(to_import)
@@ -605,6 +645,10 @@ def _insert_states_atomic(
                 already_covered,
                 mid_stream_filled,
                 trailing_filled,
+                source_skipped_non_good,
+                dest_total_rows,
+                dest_good_rows,
+                gap_intervals_count,
                 min_ts,
                 None,
                 None,
@@ -694,6 +738,10 @@ def _insert_states_atomic(
         already_covered,
         mid_stream_filled,
         trailing_filled,
+        source_skipped_non_good,
+        dest_total_rows,
+        dest_good_rows,
+        gap_intervals_count,
         min_ts,
         imported_min_ts,
         imported_max_ts,

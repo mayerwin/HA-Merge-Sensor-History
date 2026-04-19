@@ -966,6 +966,15 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             grid += `<span class="result-stat-value">${r.states_mid_stream_filled.toLocaleString()}</span><span class="result-stat-label">&nbsp;&nbsp;&mdash; mid-stream gap-fill</span>`;
           if (r.states_trailing_filled > 0)
             grid += `<span class="result-stat-value">${r.states_trailing_filled.toLocaleString()}</span><span class="result-stat-label">&nbsp;&nbsp;&mdash; trailing fill (past destination's newest)</span>`;
+          if (r.states_source_skipped_non_good > 0)
+            grid += `<span class="result-stat-value">${r.states_source_skipped_non_good.toLocaleString()}</span><span class="result-stat-label">skipped (source was unavailable/unknown in a gap)</span>`;
+          // Diagnostic block: helps the user see WHY nothing was filled.
+          // Only shown when the user enabled gap-fill (dest_total_rows > 0).
+          if (r.states_dest_total_rows > 0) {
+            const hidden = r.states_dest_total_rows - r.states_dest_good_rows;
+            const diag = `Destination history: ${r.states_dest_total_rows.toLocaleString()} rows total, ${r.states_dest_good_rows.toLocaleString()} good, ${hidden.toLocaleString()} hidden (unavailable/unknown). Gap intervals \u2265 threshold detected: <strong>${r.states_gap_intervals_count.toLocaleString()}</strong>.`;
+            grid += `<span class="result-stat-range" style="grid-column:1/-1">${diag}</span>`;
+          }
           if (r.states_imported_start && r.states_imported_end) {
             const range = `${this._formatTs(r.states_imported_start)} \u2192 ${this._formatTs(r.states_imported_end)}`;
             grid += `<span class="result-stat-range" style="grid-column:1/-1">${range}</span>`;
