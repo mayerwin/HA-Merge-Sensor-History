@@ -11,6 +11,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     this._pairs = [{ source: "", destination: "" }];
     this._importing = false;
     this._results = null;
+    this._debugByPair = new Map();
   }
 
   set hass(hass) {
@@ -326,6 +327,25 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           margin-top: 2px;
           padding-top: 2px;
         }
+        .debug-dl-btn {
+          background: transparent;
+          border: 1px solid color-mix(in srgb, var(--primary-color, #03a9f4) 50%, transparent);
+          color: var(--primary-color, #03a9f4);
+          font-size: 10px;
+          font-weight: 500;
+          font-family: inherit;
+          padding: 2px 8px;
+          border-radius: 4px;
+          margin-left: 8px;
+          cursor: pointer;
+          letter-spacing: 0.3px;
+          text-transform: none;
+          vertical-align: middle;
+          transition: background 0.15s;
+        }
+        .debug-dl-btn:hover {
+          background: color-mix(in srgb, var(--primary-color, #03a9f4) 12%, transparent);
+        }
         .spinner {
           display: inline-block;
           width: 16px;
@@ -616,6 +636,12 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       this._handleBulkAdd();
     });
 
+    this._resultsContainer.addEventListener("click", (ev) => {
+      const btn = ev.target.closest(".debug-dl-btn");
+      if (!btn) return;
+      this._downloadDebug(btn.dataset.pair, btn.dataset.kind);
+    });
+
     this._renderPairs();
   }
 
@@ -883,6 +909,40 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     }
   }
 
+  _downloadDebug(pairKey, kind) {
+    const pair = this._debugByPair.get(pairKey);
+    if (!pair) return;
+    const rows = pair[kind] || [];
+    const sanitize = (s) => (s || "").replace(/[^a-zA-Z0-9._-]+/g, "_");
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[:.]/g, "-")
+      .slice(0, 19);
+    const filename = `merge_history__${sanitize(pair.source)}__to__${sanitize(
+      pair.destination
+    )}__${kind}__${stamp}.json`;
+    const payload = {
+      generated_at: new Date().toISOString(),
+      source_entity_id: pair.source,
+      destination_entity_id: pair.destination,
+      kind,
+      row_count: rows.length,
+      rows,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.style.display = "none";
+    this.shadowRoot.appendChild(a);
+    a.click();
+    this.shadowRoot.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
   /** Format an ISO datetime string for display. Returns "" if null. */
   _formatTs(iso) {
     if (!iso) return "";
@@ -911,13 +971,25 @@ class MergeSensorsHistoryPanel extends HTMLElement {
   }
 
   _renderResults(results) {
+    this._debugByPair.clear();
+    results.forEach((r, i) => {
+      this._debugByPair.set(`${i}`, {
+        source: r.source,
+        destination: r.destination,
+        states: r.debug_states || [],
+        stats: r.debug_stats || [],
+        stats_short: r.debug_stats_short || [],
+      });
+    });
+
     this._resultsContainer.innerHTML = results
-      .map((r) => {
+      .map((r, i) => {
         const srcName = this._friendlyName(r.source);
         const dstName = this._friendlyName(r.destination);
         const srcLabel = srcName ? `${r.source} (${srcName})` : r.source;
         const dstLabel = dstName ? `${r.destination} (${dstName})` : r.destination;
         const pairLabel = `${srcLabel} \u2192 ${dstLabel}`;
+        const pairKey = `${i}`;
 
         if (r.error) {
           return `<div class="result-item result-error">
@@ -955,9 +1027,14 @@ class MergeSensorsHistoryPanel extends HTMLElement {
 
         let grid = "";
 
+        const dlBtn = (kind, count) =>
+          count > 0
+            ? `<button class="debug-dl-btn" data-pair="${pairKey}" data-kind="${kind}" title="Download per-row debug JSON for this section">&#x2B07; debug JSON (${count.toLocaleString()} rows)</button>`
+            : "";
+
         // --- States summary ---
         if (r.states_source_total > 0) {
-          grid += `<span class="result-stat-label">States</span><span class="result-stat-label"></span>`;
+          grid += `<span class="result-stat-label">States ${dlBtn("states", (r.debug_states || []).length)}</span><span class="result-stat-label"></span>`;
           grid += `<span class="result-stat-value">${r.states_source_total.toLocaleString()}</span><span class="result-stat-label">total in source</span>`;
           if (r.states_already_covered > 0)
             grid += `<span class="result-stat-value">${r.states_already_covered.toLocaleString()}</span><span class="result-stat-label">already present in destination</span>`;
@@ -988,7 +1065,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         const hasStatsInfo =
           r.stats_source_total > 0 || r.stats_imported > 0 || r.stats_error;
         if (hasStatsInfo) {
-          grid += `<span class="result-stat-label" style="margin-top:6px">Long-term statistics (hourly)</span><span class="result-stat-label"></span>`;
+          grid += `<span class="result-stat-label" style="margin-top:6px">Long-term statistics (hourly) ${dlBtn("stats", (r.debug_stats || []).length)}</span><span class="result-stat-label"></span>`;
           if (r.stats_source_total > 0)
             grid += `<span class="result-stat-value">${r.stats_source_total.toLocaleString()}</span><span class="result-stat-label">total in source</span>`;
           if (r.stats_already_covered > 0)
@@ -1016,7 +1093,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           (r.stats_short_imported || 0) > 0 ||
           r.stats_short_error;
         if (hasShortInfo) {
-          grid += `<span class="result-stat-label" style="margin-top:6px">Short-term statistics (5-min)</span><span class="result-stat-label"></span>`;
+          grid += `<span class="result-stat-label" style="margin-top:6px">Short-term statistics (5-min) ${dlBtn("stats_short", (r.debug_stats_short || []).length)}</span><span class="result-stat-label"></span>`;
           if (r.stats_short_source_total > 0)
             grid += `<span class="result-stat-value">${r.stats_short_source_total.toLocaleString()}</span><span class="result-stat-label">total in source</span>`;
           if (r.stats_short_already_covered > 0)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import bisect
 import hashlib
 import json
 import logging
@@ -273,6 +274,11 @@ async def _async_import_pair(
         "stats_short_skipped_recent": 0,
         "stats_short_imported_start": None,
         "stats_short_imported_end": None,
+        # Per-row debug records, for client-side download as JSON.
+        # Each is a list of dicts; populated even when nothing was imported.
+        "debug_states": [],
+        "debug_stats": [],
+        "debug_stats_short": [],
         "error": None,
     }
 
@@ -373,6 +379,7 @@ async def _do_import(
         _cutoff_ts,
         imported_min_ts,
         imported_max_ts,
+        debug_states,
     ) = await recorder.async_add_executor_job(
         partial(
             _insert_states_atomic,
@@ -391,6 +398,7 @@ async def _do_import(
     result["states_dest_total_rows"] = dest_total_rows
     result["states_dest_good_rows"] = dest_good_rows
     result["states_gap_intervals_count"] = gap_intervals_count
+    result["debug_states"] = debug_states
     if imported_min_ts is not None:
         result["states_imported_start"] = datetime.fromtimestamp(
             imported_min_ts, tz=timezone.utc
@@ -455,7 +463,18 @@ def _insert_states_atomic(
     fill_gaps: bool = False,
     gap_threshold_minutes: int = 60,
 ) -> tuple[
-    int, int, int, int, int, int, int, int, float | None, float | None, float | None
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    float | None,
+    float | None,
+    float | None,
+    list[dict],
 ]:
     """Insert State objects into the recorder database for a destination entity.
 
@@ -481,8 +500,10 @@ def _insert_states_atomic(
 
     Returns (inserted, already_covered, mid_stream_filled, trailing_filled,
     source_skipped_non_good, dest_total_rows, dest_good_rows,
-    gap_intervals_count, cutoff_ts, imported_min_ts, imported_max_ts).
-    The last two are None if nothing was imported.
+    gap_intervals_count, cutoff_ts, imported_min_ts, imported_max_ts,
+    debug_records). imported_min_ts / imported_max_ts are None if nothing was
+    imported. debug_records is one dict per source state with its decision
+    and the adjacent destination context.
     """
     inserted = 0
     imported_min_ts: float | None = None
@@ -493,6 +514,7 @@ def _insert_states_atomic(
     dest_total_rows = 0
     dest_good_rows = 0
     gap_intervals_count = 0
+    debug_records: list[dict] = []
     session = recorder_instance.get_session()
 
     try:
@@ -519,9 +541,27 @@ def _insert_states_atomic(
         )
 
         # -- Decide which source states to import --
+        # Single classification pass: each source state is either head /
+        # mid_stream / trailing / various skip reasons. The same pass produces
+        # the per-row debug_records list returned to the UI.
         if min_ts is None:
-            # No destination history: import everything, no gap logic needed.
             to_import = list(source_states)
+            for s in source_states:
+                debug_records.append(
+                    {
+                        "ts": s.last_updated.isoformat(),
+                        "ts_epoch": s.last_updated.timestamp(),
+                        "source_value": (
+                            str(s.state) if s.state is not None else None
+                        ),
+                        "dest_has_row_at_same_ts": False,
+                        "prev_dest_good_ts": None,
+                        "next_dest_good_ts": None,
+                        "gap_minutes": None,
+                        "decision": "imported_no_destination_history",
+                        "reason": "Destination had no prior history; full import.",
+                    }
+                )
             _LOGGER.info(
                 "Destination %s has no history — importing all %d source states",
                 dest_entity_id,
@@ -530,23 +570,22 @@ def _insert_states_atomic(
         else:
             cutoff_dt = datetime.fromtimestamp(min_ts, tz=timezone.utc)
 
-            # Head fill: strictly older than destination's oldest.
-            head = [s for s in source_states if s.last_updated < cutoff_dt]
-
+            head: list = []
             mid_stream: list = []
             trailing: list = []
 
+            dest_ts_set: set[float] = set()
+            good_dest_ts_list: list[float] = []
+            dest_max_good_ts: float | None = None
+            trailing_allowed = False
+            threshold_sec = gap_threshold_minutes * 60.0
+
             if fill_gaps:
                 # Load every destination row's timestamp + state value (ordered).
-                # We need the value to filter "non-good" states (unavailable /
-                # unknown / NULL) out of gap detection: HA hides those in the
-                # History panel so a long unavailable streak LOOKS like a gap,
-                # even though the rows are physically present in the DB. Without
-                # this filter, mid-stream fill never triggers because consecutive
-                # `unavailable` rows are typically only seconds apart.
-                #
-                # `dest_ts_set` (all rows) is still used for exact-timestamp
-                # dedup, so we never insert a twin alongside an unavailable row.
+                # We need the state value to filter `unavailable` / `unknown` out
+                # of gap detection: HA hides those in the History panel so a long
+                # unavailable streak LOOKS like a gap, even though the rows are
+                # physically present in the DB.
                 dest_rows = (
                     session.query(States.last_updated_ts, States.state)
                     .filter(States.metadata_id == metadata_id)
@@ -562,57 +601,152 @@ def _insert_states_atomic(
                 dest_total_rows = len(dest_rows)
                 dest_good_rows = len(good_dest_ts_list)
 
-                threshold_sec = gap_threshold_minutes * 60.0
-
-                # Mid-stream: intervals between consecutive *good* dest
-                # timestamps whose delta exceeds the threshold.
-                gap_intervals: list[tuple[float, float]] = []
+                # Gap-interval count is purely diagnostic (shown in result panel).
                 for i in range(len(good_dest_ts_list) - 1):
-                    prev_ts = good_dest_ts_list[i]
-                    next_ts = good_dest_ts_list[i + 1]
-                    if (next_ts - prev_ts) >= threshold_sec:
-                        gap_intervals.append((prev_ts, next_ts))
-                gap_intervals_count = len(gap_intervals)
+                    if (
+                        good_dest_ts_list[i + 1] - good_dest_ts_list[i]
+                    ) >= threshold_sec:
+                        gap_intervals_count += 1
 
-                if gap_intervals:
-                    # Source states are sorted chronologically; scan once.
-                    # Skip non-good source states (unavailable/unknown) — they
-                    # would just add another hidden row without closing the gap.
-                    gi = 0
-                    for s in source_states:
-                        ts = s.last_updated.timestamp()
-                        # Advance to the first interval whose upper bound is > ts.
-                        while gi < len(gap_intervals) and gap_intervals[gi][1] <= ts:
-                            gi += 1
-                        if gi >= len(gap_intervals):
-                            break
-                        lo, hi = gap_intervals[gi]
-                        if not (lo < ts < hi):
-                            continue
-                        if ts in dest_ts_set:
-                            continue
-                        if s.state is None or s.state in _NON_GOOD_STATES:
-                            source_skipped_non_good += 1
-                            continue
-                        mid_stream.append(s)
-
-                # Trailing: states strictly newer than dest's newest *good*
-                # state, if the gap from there to now() meets the threshold.
-                # Using the last good ts (rather than the last raw row) means
-                # a sensor that's currently `unavailable` for >= threshold
-                # qualifies for trailing fill from source.
                 if good_dest_ts_list:
                     dest_max_good_ts = good_dest_ts_list[-1]
                     now_ts = datetime.now(timezone.utc).timestamp()
-                    if (now_ts - dest_max_good_ts) >= threshold_sec:
-                        for s in source_states:
-                            ts = s.last_updated.timestamp()
-                            if ts <= dest_max_good_ts or ts in dest_ts_set:
-                                continue
-                            if s.state is None or s.state in _NON_GOOD_STATES:
-                                source_skipped_non_good += 1
-                                continue
-                            trailing.append(s)
+                    trailing_allowed = (
+                        now_ts - dest_max_good_ts
+                    ) >= threshold_sec
+
+            for s in source_states:
+                ts = s.last_updated.timestamp()
+                src_val = str(s.state) if s.state is not None else None
+                rec: dict[str, Any] = {
+                    "ts": s.last_updated.isoformat(),
+                    "ts_epoch": ts,
+                    "source_value": src_val,
+                    "dest_has_row_at_same_ts": ts in dest_ts_set,
+                }
+
+                if good_dest_ts_list:
+                    i_left = bisect.bisect_left(good_dest_ts_list, ts)
+                    i_right = bisect.bisect_right(good_dest_ts_list, ts)
+                    prev_good = (
+                        good_dest_ts_list[i_left - 1] if i_left > 0 else None
+                    )
+                    next_good = (
+                        good_dest_ts_list[i_right]
+                        if i_right < len(good_dest_ts_list)
+                        else None
+                    )
+                else:
+                    prev_good = None
+                    next_good = None
+
+                rec["prev_dest_good_ts"] = (
+                    datetime.fromtimestamp(
+                        prev_good, tz=timezone.utc
+                    ).isoformat()
+                    if prev_good is not None
+                    else None
+                )
+                rec["next_dest_good_ts"] = (
+                    datetime.fromtimestamp(
+                        next_good, tz=timezone.utc
+                    ).isoformat()
+                    if next_good is not None
+                    else None
+                )
+                rec["gap_minutes"] = (
+                    round((next_good - prev_good) / 60.0, 3)
+                    if (prev_good is not None and next_good is not None)
+                    else None
+                )
+
+                if s.last_updated < cutoff_dt:
+                    head.append(s)
+                    rec["decision"] = "head_imported"
+                    rec["reason"] = (
+                        "Older than destination's oldest entry — head fill."
+                    )
+                elif not fill_gaps:
+                    rec["decision"] = "skipped_fill_gaps_disabled"
+                    rec["reason"] = (
+                        "Inside destination's existing range; "
+                        "Fill Gaps option is off."
+                    )
+                elif ts in dest_ts_set:
+                    rec["decision"] = "skipped_dest_has_same_ts"
+                    rec["reason"] = (
+                        "Destination already has a row at this exact timestamp."
+                    )
+                elif s.state is None or s.state in _NON_GOOD_STATES:
+                    in_qualifying_gap = (
+                        prev_good is not None
+                        and next_good is not None
+                        and (next_good - prev_good) >= threshold_sec
+                        and prev_good < ts < next_good
+                    )
+                    in_trailing_gap = (
+                        dest_max_good_ts is not None
+                        and ts > dest_max_good_ts
+                        and trailing_allowed
+                    )
+                    if in_qualifying_gap or in_trailing_gap:
+                        source_skipped_non_good += 1
+                        rec["decision"] = "skipped_source_non_good"
+                        rec["reason"] = (
+                            "Source value is unavailable/unknown; would just "
+                            "add another hidden row without closing the gap."
+                        )
+                    else:
+                        rec["decision"] = "skipped_no_qualifying_gap"
+                        rec["reason"] = (
+                            "Source value is unavailable/unknown and not in "
+                            "a qualifying gap."
+                        )
+                elif dest_max_good_ts is not None and ts > dest_max_good_ts:
+                    if trailing_allowed:
+                        trailing.append(s)
+                        rec["decision"] = "trailing_imported"
+                        rec["reason"] = (
+                            "Past destination's newest good entry; trailing "
+                            "gap meets threshold."
+                        )
+                    else:
+                        rec["decision"] = "skipped_trailing_below_threshold"
+                        rec["reason"] = (
+                            "Past destination's newest good but trailing gap "
+                            f"is below {gap_threshold_minutes} min threshold."
+                        )
+                elif (
+                    prev_good is not None
+                    and next_good is not None
+                    and (next_good - prev_good) >= threshold_sec
+                    and prev_good < ts < next_good
+                ):
+                    mid_stream.append(s)
+                    rec["decision"] = "mid_stream_imported"
+                    rec["reason"] = (
+                        f"Inside a {rec['gap_minutes']} min gap between "
+                        "destination good entries."
+                    )
+                else:
+                    rec["decision"] = "skipped_no_qualifying_gap"
+                    if rec["gap_minutes"] is not None:
+                        rec["reason"] = (
+                            f"Adjacent good entries are {rec['gap_minutes']} "
+                            f"min apart (below {gap_threshold_minutes} min "
+                            "threshold)."
+                        )
+                    elif not good_dest_ts_list:
+                        rec["reason"] = (
+                            "Destination has no good entries to define a gap."
+                        )
+                    else:
+                        rec["reason"] = (
+                            "No surrounding good destination entries to "
+                            "define a gap."
+                        )
+
+                debug_records.append(rec)
 
             to_import = head + mid_stream + trailing
             mid_stream_filled = len(mid_stream)
@@ -652,6 +786,7 @@ def _insert_states_atomic(
                 min_ts,
                 None,
                 None,
+                debug_records,
             )
 
         # Ensure to_import is sorted chronologically for min/max and a stable
@@ -745,6 +880,7 @@ def _insert_states_atomic(
         min_ts,
         imported_min_ts,
         imported_max_ts,
+        debug_records,
     )
 
 
@@ -847,6 +983,93 @@ def _compute_sum_offset(
     return offset
 
 
+def _build_stats_debug_records(
+    source_rows: list[dict],
+    dest_by_start: dict[float, dict],
+    stat_cols: tuple[str, ...],
+    recent_cutoff_ts: float,
+    sum_offset: float | None,
+    *,
+    dest_max_ts: float | None = None,
+    trailing_allowed: bool = True,
+    gap_threshold_minutes: int | None = None,
+) -> list[dict]:
+    """Per-source-row classification used for the downloadable debug JSON.
+
+    Mirrors the import partitioning logic exactly. For short-term stats, pass
+    `dest_max_ts`, `trailing_allowed`, and `gap_threshold_minutes` so the
+    "skipped because past dest's newest below threshold" branch is reported.
+    For LTS, leave those defaults — there is no trailing-threshold gate.
+    """
+    records: list[dict] = []
+    for src_row in source_rows:
+        start_ts = _row_start_ts(src_row)
+        rec: dict[str, Any] = {
+            "start": datetime.fromtimestamp(start_ts, tz=timezone.utc).isoformat(),
+            "start_epoch": start_ts,
+        }
+        for k in stat_cols:
+            rec[f"source_{k}"] = src_row.get(k)
+
+        dest_row = dest_by_start.get(start_ts)
+        for k in stat_cols:
+            rec[f"dest_{k}"] = dest_row.get(k) if dest_row else None
+
+        src_values = {
+            k: src_row[k] for k in stat_cols if src_row.get(k) is not None
+        }
+
+        if start_ts > recent_cutoff_ts:
+            rec["decision"] = "skipped_recent"
+            rec["reason"] = (
+                "Within the recent-compile safety window; HA may still be "
+                "compiling this slot."
+            )
+        elif (
+            dest_max_ts is not None
+            and start_ts > dest_max_ts
+            and not trailing_allowed
+        ):
+            rec["decision"] = "skipped_trailing_below_threshold"
+            rec["reason"] = (
+                "Past destination's newest stats slot but trailing gap is "
+                f"below {gap_threshold_minutes} min threshold."
+            )
+        elif not src_values:
+            rec["decision"] = "skipped_source_empty"
+            rec["reason"] = "Source has a row for this slot but no useful values."
+        elif dest_row is None:
+            rec["decision"] = "imported_no_dest_row"
+            rec["reason"] = (
+                "Destination has no row for this slot — full insert from source."
+            )
+            if sum_offset is not None and "sum" in src_values:
+                rec["applied_sum_offset"] = sum_offset
+        else:
+            dest_values = {
+                k: dest_row[k] for k in stat_cols if dest_row.get(k) is not None
+            }
+            fillable = {
+                k: v for k, v in src_values.items() if k not in dest_values
+            }
+            if not fillable:
+                rec["decision"] = "already_complete"
+                rec["reason"] = (
+                    "Destination already has non-NULL values for every column "
+                    "the source provides."
+                )
+            else:
+                rec["decision"] = "imported_gap_filled"
+                rec["reason"] = (
+                    "Destination row exists but is missing column(s): "
+                    + ", ".join(sorted(fillable))
+                )
+                if sum_offset is not None and "sum" in fillable:
+                    rec["applied_sum_offset"] = sum_offset
+        records.append(rec)
+    return records
+
+
 async def _async_import_statistics_for_pair(
     hass: HomeAssistant,
     source_id: str,
@@ -892,6 +1115,7 @@ async def _async_import_statistics_for_pair(
         "stats_imported_end": None,
         "stats_sum_offset": None,
         "stats_unit": None,
+        "debug_stats": [],
     }
 
     # -- Compute recent-hour cutoff (UTC, aligned to hour) --
@@ -945,6 +1169,13 @@ async def _async_import_statistics_for_pair(
     already_covered = 0
     skipped_recent = 0
     gap_filled = 0
+    debug_stats = _build_stats_debug_records(
+        source_rows,
+        dest_by_start,
+        stat_cols,
+        recent_cutoff_ts,
+        sum_offset,
+    )
 
     for src_row in source_rows:
         start_ts = _row_start_ts(src_row)
@@ -992,6 +1223,7 @@ async def _async_import_statistics_for_pair(
     out["stats_already_covered"] = already_covered
     out["stats_skipped_recent"] = skipped_recent
     out["stats_gap_filled"] = gap_filled
+    out["debug_stats"] = debug_stats
 
     if not to_import_rows:
         if sum_offset is not None:
@@ -1173,6 +1405,7 @@ async def _async_import_short_term_statistics_for_pair(
         "stats_short_skipped_recent": 0,
         "stats_short_imported_start": None,
         "stats_short_imported_end": None,
+        "debug_stats_short": [],
     }
 
     # -- Recent-slot cutoff: floor_5min(now) - 10 min --
@@ -1215,6 +1448,16 @@ async def _async_import_short_term_statistics_for_pair(
     to_import_rows: list[tuple[float, dict[str, Any]]] = []
     already_covered = 0
     skipped_recent = 0
+    debug_stats_short = _build_stats_debug_records(
+        source_rows,
+        dest_by_start,
+        stat_cols,
+        recent_cutoff_ts,
+        sum_offset,
+        dest_max_ts=dest_max_ts,
+        trailing_allowed=trailing_allowed,
+        gap_threshold_minutes=gap_threshold_minutes,
+    )
 
     for src_row in source_rows:
         start_ts = _row_start_ts(src_row)
@@ -1262,6 +1505,7 @@ async def _async_import_short_term_statistics_for_pair(
 
     out["stats_short_already_covered"] = already_covered
     out["stats_short_skipped_recent"] = skipped_recent
+    out["debug_stats_short"] = debug_stats_short
 
     if not to_import_rows:
         return out
