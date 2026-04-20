@@ -59,15 +59,22 @@ _EPOCH = datetime(2000, 1, 1, tzinfo=timezone.utc)
 _NON_GOOD_STATES = frozenset({"unavailable", "unknown"})
 
 
+def _hash_panel_file(panel_path: str) -> str:
+    """Compute a short cache-busting hash of the panel.js file."""
+    with open(panel_path, "rb") as f:
+        return hashlib.md5(f.read()).hexdigest()[:8]
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Merge Sensor History from a config entry."""
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN].setdefault("_locks", {})
 
-    # Register the panel with cache-busting hash
+    # Register the panel with cache-busting hash.
+    # File I/O must run in an executor — HA flags sync open() inside the
+    # event loop as a blocking call.
     panel_path = os.path.join(os.path.dirname(__file__), "frontend", "panel.js")
-    with open(panel_path, "rb") as f:
-        panel_hash = hashlib.md5(f.read()).hexdigest()[:8]
+    panel_hash = await hass.async_add_executor_job(_hash_panel_file, panel_path)
 
     await hass.http.async_register_static_paths(
         [StaticPathConfig(f"/{DOMAIN}/panel.js", panel_path, cache_headers=True)]
