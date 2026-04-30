@@ -173,6 +173,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         vol.Optional("gap_threshold_minutes", default=60): vol.All(
             vol.Coerce(int), vol.Range(min=1, max=1440)
         ),
+        vol.Optional("dry_run", default=False): bool,
     }
 )
 @websocket_api.async_response
@@ -183,6 +184,7 @@ async def ws_import_history(
     pairs = msg["pairs"]
     fill_gaps = bool(msg.get("fill_gaps", False))
     gap_threshold_minutes = int(msg.get("gap_threshold_minutes", 60))
+    dry_run = bool(msg.get("dry_run", False))
     results = []
 
     for pair in pairs:
@@ -192,11 +194,13 @@ async def ws_import_history(
             pair["destination"],
             fill_gaps=fill_gaps,
             gap_threshold_minutes=gap_threshold_minutes,
+            dry_run=dry_run,
         )
         results.append(
             {
                 "source": pair["source"],
                 "destination": pair["destination"],
+                "dry_run": dry_run,
                 **result,
             }
         )
@@ -227,6 +231,7 @@ async def _async_import_pair(
     *,
     fill_gaps: bool = False,
     gap_threshold_minutes: int = 60,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Import all history from source entity into destination entity.
 
@@ -248,6 +253,9 @@ async def _async_import_pair(
       (now - dest_newest) >= `gap_threshold_minutes`.
     - Backfills short-term statistics for hours/5-min slots where the
       destination has no short-term stats row.
+
+    When `dry_run` is True:
+    - Calculates all changes but does not write to the database.
 
     Returns a dict with result details for the UI.
     """
@@ -315,10 +323,14 @@ async def _async_import_pair(
                 result,
                 fill_gaps=fill_gaps,
                 gap_threshold_minutes=gap_threshold_minutes,
+                dry_run=dry_run,
             )
         except Exception as exc:
             _LOGGER.exception(
-                "Error importing history from %s to %s", source_id, dest_id
+                "Error importing history from %s to %s (dry_run=%s)",
+                source_id,
+                dest_id,
+                dry_run,
             )
             result["error"] = f"Import failed: {exc}"
 
@@ -333,6 +345,7 @@ async def _do_import(
     *,
     fill_gaps: bool = False,
     gap_threshold_minutes: int = 60,
+    dry_run: bool = False,
 ) -> None:
     """Execute the actual import. Separated for clean lock/error handling."""
     recorder = get_instance(hass)
@@ -395,6 +408,7 @@ async def _do_import(
             source_states,
             fill_gaps=fill_gaps,
             gap_threshold_minutes=gap_threshold_minutes,
+            dry_run=dry_run,
         )
     )
     result["states_imported"] = imported
@@ -425,7 +439,7 @@ async def _do_import(
     # Done independently: a stats failure should not hide a successful states import.
     try:
         stats_result = await _async_import_statistics_for_pair(
-            hass, source_id, dest_id
+            hass, source_id, dest_id, dry_run=dry_run
         )
         result.update(stats_result)
     except Exception as exc:
@@ -450,6 +464,7 @@ async def _do_import(
                 source_id,
                 dest_id,
                 gap_threshold_minutes=gap_threshold_minutes,
+                dry_run=dry_run,
             )
             result.update(short_result)
         except Exception as exc:
@@ -469,6 +484,7 @@ def _insert_states_atomic(
     *,
     fill_gaps: bool = False,
     gap_threshold_minutes: int = 60,
+    dry_run: bool = False,
 ) -> tuple[
     int,
     int,
@@ -532,20 +548,29 @@ def _insert_states_atomic(
             .first()
         )
         if meta is None:
-            meta = StatesMeta(entity_id=dest_entity_id)
-            session.add(meta)
-            session.flush()
-
-        metadata_id = meta.metadata_id
+            if dry_run:
+                # In dry run, we don't have a metadata_id if it doesn't exist.
+                # Use a dummy ID to satisfy the rest of the function logic.
+                metadata_id = -1
+            else:
+                meta = StatesMeta(entity_id=dest_entity_id)
+                session.add(meta)
+                session.flush()
+                metadata_id = meta.metadata_id
+        else:
+            metadata_id = meta.metadata_id
 
         # -- Query the TRUE oldest timestamp for the destination entity --
         # This runs in the same transaction as the inserts: no TOCTOU race.
         # Uses MIN(last_updated_ts) which captures ALL row types.
-        min_ts: float | None = (
-            session.query(sql_func.min(States.last_updated_ts))
-            .filter(States.metadata_id == metadata_id)
-            .scalar()
-        )
+        if metadata_id == -1:
+            min_ts = None
+        else:
+            min_ts = (
+                session.query(sql_func.min(States.last_updated_ts))
+                .filter(States.metadata_id == metadata_id)
+                .scalar()
+            )
 
         # -- Decide which source states to import --
         # Single classification pass: each source state is either head /
@@ -570,8 +595,9 @@ def _insert_states_atomic(
                     }
                 )
             _LOGGER.info(
-                "Destination %s has no history — importing all %d source states",
+                "Destination %s has no history — %s %d source states",
                 dest_entity_id,
+                "would import" if dry_run else "importing all",
                 len(source_states),
             )
         else:
@@ -763,7 +789,7 @@ def _insert_states_atomic(
                 "Destination %s oldest entry: %s — head: %d, mid-stream: %d, "
                 "trailing: %d, source_skipped_non_good: %d "
                 "(fill_gaps=%s, threshold=%dmin, %d source states, "
-                "dest rows: %d total / %d good, %d gap intervals)",
+                "dest rows: %d total / %d good, %d gap intervals, dry_run=%s)",
                 dest_entity_id,
                 cutoff_dt.isoformat(),
                 len(head),
@@ -776,13 +802,20 @@ def _insert_states_atomic(
                 dest_total_rows,
                 dest_good_rows,
                 gap_intervals_count,
+                dry_run,
             )
 
         already_covered = len(source_states) - len(to_import)
 
-        if not to_import:
+        if not to_import or dry_run:
+            if dry_run:
+                inserted = len(to_import)
+                if to_import:
+                    imported_min_ts = to_import[0].last_updated.timestamp()
+                    imported_max_ts = to_import[-1].last_updated.timestamp()
+
             return (
-                0,
+                inserted,
                 already_covered,
                 mid_stream_filled,
                 trailing_filled,
@@ -791,8 +824,8 @@ def _insert_states_atomic(
                 dest_good_rows,
                 gap_intervals_count,
                 min_ts,
-                None,
-                None,
+                imported_min_ts,
+                imported_max_ts,
                 debug_records,
             )
 
@@ -1081,6 +1114,8 @@ async def _async_import_statistics_for_pair(
     hass: HomeAssistant,
     source_id: str,
     dest_id: str,
+    *,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Import long-term statistics from source to destination — gap-fill mode.
 
@@ -1289,7 +1324,14 @@ async def _async_import_statistics_for_pair(
         stats_data.append(StatisticData(**entry))
 
     # -- Queue the import (fire-and-forget on the recorder thread) --
-    async_import_statistics(hass, metadata, stats_data)
+    if dry_run:
+        _LOGGER.info(
+            "Dry run: skipping queueing of %d statistics rows for %s",
+            len(stats_data),
+            dest_id,
+        )
+    else:
+        async_import_statistics(hass, metadata, stats_data)
 
     imported_starts = sorted(start_ts for start_ts, _ in to_import_rows)
     out["stats_imported"] = len(stats_data)
@@ -1303,9 +1345,10 @@ async def _async_import_statistics_for_pair(
         out["stats_sum_offset"] = sum_offset
 
     _LOGGER.info(
-        "Queued %d statistics rows for %s "
+        "%s %d statistics rows for %s "
         "(%d already complete in destination, %d gap-filled (NULL columns), "
         "%d skipped as too recent, sum offset: %s)",
+        "Would queue" if dry_run else "Queued",
         len(stats_data),
         dest_id,
         already_covered,
@@ -1377,6 +1420,7 @@ async def _async_import_short_term_statistics_for_pair(
     dest_id: str,
     *,
     gap_threshold_minutes: int,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Backfill short-term (5-minute) statistics from source to destination.
 
@@ -1560,7 +1604,14 @@ async def _async_import_short_term_statistics_for_pair(
     # This path runs under HA's unique-constraint integrity-error filter and
     # correctly updates ShortTermStatisticsRunCache — much safer than direct
     # ORM inserts.
-    recorder.async_import_statistics(metadata, stats_data, StatisticsShortTerm)
+    if dry_run:
+        _LOGGER.info(
+            "Dry run: skipping queueing of %d short-term stats rows for %s",
+            len(stats_data),
+            dest_id,
+        )
+    else:
+        recorder.async_import_statistics(metadata, stats_data, StatisticsShortTerm)
 
     imported_starts = sorted(start_ts for start_ts, _ in to_import_rows)
     out["stats_short_imported"] = len(stats_data)
@@ -1572,8 +1623,9 @@ async def _async_import_short_term_statistics_for_pair(
     ).isoformat()
 
     _LOGGER.info(
-        "Queued %d short-term (5-min) stats rows for %s "
+        "%s %d short-term (5-min) stats rows for %s "
         "(%d already complete in destination, %d skipped as too recent)",
+        "Would queue" if dry_run else "Queued",
         len(stats_data),
         dest_id,
         already_covered,

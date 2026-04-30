@@ -217,6 +217,15 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           opacity: 0.45;
           cursor: not-allowed;
         }
+        .btn-preview {
+          background: var(--secondary-background-color, #f5f5f5);
+          color: var(--primary-text-color);
+          border: 1px solid var(--divider-color, #e0e0e0);
+          margin-right: 8px;
+        }
+        .btn-preview:hover:not(:disabled) {
+          background: var(--divider-color, #e0e0e0);
+        }
         .btn-primary {
           background: var(--primary-color, #03a9f4);
           color: var(--text-primary-color, white);
@@ -588,6 +597,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         <div class="actions">
           <button class="btn btn-secondary" id="add-pair-btn">+ Add Pair</button>
           <div style="flex:1"></div>
+          <button class="btn btn-preview" id="preview-btn">Preview</button>
           <button class="btn btn-primary" id="import-btn">Import History</button>
         </div>
         <div id="results-container" class="results"></div>
@@ -597,6 +607,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     this._pairsContainer = shadow.getElementById("pairs-container");
     this._resultsContainer = shadow.getElementById("results-container");
     this._importBtn = shadow.getElementById("import-btn");
+    this._previewBtn = shadow.getElementById("preview-btn");
     this._filterInput = shadow.getElementById("entity-filter");
     this._bulkBody = shadow.getElementById("bulk-body");
     this._bulkChevron = shadow.getElementById("bulk-chevron");
@@ -622,6 +633,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     });
 
     this._importBtn.addEventListener("click", () => this._doImport());
+    this._previewBtn.addEventListener("click", () => this._doImport(true));
 
     this._filterInput.addEventListener("input", () => {
       this._renderPairs();
@@ -826,7 +838,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     this._renderPairs();
   }
 
-  async _doImport() {
+  async _doImport(dryRun = false) {
     const validPairs = this._pairs.filter((p) => p.source && p.destination);
     if (validPairs.length === 0) {
       alert("Please select at least one complete source/destination pair.");
@@ -854,34 +866,41 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       gapThresholdMinutes = 60;
     }
 
-    const pairLines = validPairs
-      .map((p) => {
-        const sn = this._friendlyName(p.source);
-        const dn = this._friendlyName(p.destination);
-        const src = sn ? `${p.source} (${sn})` : p.source;
-        const dst = dn ? `${p.destination} (${dn})` : p.destination;
-        return `  ${src}  \u2192  ${dst}`;
-      })
-      .join("\n");
+    if (!dryRun) {
+      const pairLines = validPairs
+        .map((p) => {
+          const sn = this._friendlyName(p.source);
+          const dn = this._friendlyName(p.destination);
+          const src = sn ? `${p.source} (${sn})` : p.source;
+          const dst = dn ? `${p.destination} (${dn})` : p.destination;
+          return `  ${src}  \u2192  ${dst}`;
+        })
+        .join("\n");
 
-    const gapsLine = fillGaps
-      ? `\n\nMid-stream & trailing gap-fill: ON (threshold ${gapThresholdMinutes} min)`
-      : "";
+      const gapsLine = fillGaps
+        ? `\n\nMid-stream & trailing gap-fill: ON (threshold ${gapThresholdMinutes} min)`
+        : "";
 
-    if (
-      !confirm(
-        `Import history for ${validPairs.length} pair(s)?\n\n` +
-          pairLines +
-          gapsLine +
-          "\n\nThis will write to your recorder database."
-      )
-    ) {
-      return;
+      if (
+        !confirm(
+          `Import history for ${validPairs.length} pair(s)?\n\n` +
+            pairLines +
+            gapsLine +
+            "\n\nThis will write to your recorder database."
+        )
+      ) {
+        return;
+      }
     }
 
     this._importing = true;
     this._importBtn.disabled = true;
-    this._importBtn.innerHTML = '<span class="spinner"></span>Importing\u2026';
+    this._previewBtn.disabled = true;
+    if (dryRun) {
+      this._previewBtn.innerHTML = '<span class="spinner"></span>Analyzing\u2026';
+    } else {
+      this._importBtn.innerHTML = '<span class="spinner"></span>Importing\u2026';
+    }
     this._resultsContainer.innerHTML = "";
 
     try {
@@ -890,6 +909,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         pairs: validPairs,
         fill_gaps: fillGaps,
         gap_threshold_minutes: gapThresholdMinutes,
+        dry_run: dryRun,
       });
 
       this._renderResults(response.results);
@@ -898,14 +918,16 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         <div class="result-item result-error">
           <div class="result-header">
             <span class="result-icon">&#10060;</span>
-            Import failed
+            ${dryRun ? "Analysis" : "Import"} failed
           </div>
           <div class="result-details">${err.message || err}</div>
         </div>`;
     } finally {
       this._importing = false;
       this._importBtn.disabled = false;
+      this._previewBtn.disabled = false;
       this._importBtn.textContent = "Import History";
+      this._previewBtn.textContent = "Preview";
     }
   }
 
@@ -988,7 +1010,8 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         const dstName = this._friendlyName(r.destination);
         const srcLabel = srcName ? `${r.source} (${srcName})` : r.source;
         const dstLabel = dstName ? `${r.destination} (${dstName})` : r.destination;
-        const pairLabel = `${srcLabel} \u2192 ${dstLabel}`;
+        const pairLabel = (r.dry_run ? "Preview: " : "") + `${srcLabel} \u2192 ${dstLabel}`;
+        const actionVerb = r.dry_run ? "would be imported" : "imported";
         const pairKey = `${i}`;
 
         if (r.error) {
@@ -1038,7 +1061,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           grid += `<span class="result-stat-value">${r.states_source_total.toLocaleString()}</span><span class="result-stat-label">total in source</span>`;
           if (r.states_already_covered > 0)
             grid += `<span class="result-stat-value">${r.states_already_covered.toLocaleString()}</span><span class="result-stat-label">already present in destination</span>`;
-          grid += `<span class="result-stat-value">${r.states_imported.toLocaleString()}</span><span class="result-stat-label">imported</span>`;
+          grid += `<span class="result-stat-value">${r.states_imported.toLocaleString()}</span><span class="result-stat-label">${actionVerb}</span>`;
           if (r.states_mid_stream_filled > 0)
             grid += `<span class="result-stat-value">${r.states_mid_stream_filled.toLocaleString()}</span><span class="result-stat-label">&nbsp;&nbsp;&mdash; mid-stream gap-fill</span>`;
           if (r.states_trailing_filled > 0)
@@ -1074,7 +1097,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             grid += `<span class="result-stat-value">${r.stats_gap_filled.toLocaleString()}</span><span class="result-stat-label">gap-filled (NULL columns in destination)</span>`;
           if (r.stats_skipped_recent > 0)
             grid += `<span class="result-stat-value">${r.stats_skipped_recent.toLocaleString()}</span><span class="result-stat-label">skipped (recent &mdash; not yet compiled by HA)</span>`;
-          grid += `<span class="result-stat-value">${(r.stats_imported || 0).toLocaleString()}</span><span class="result-stat-label">total imported</span>`;
+          grid += `<span class="result-stat-value">${(r.stats_imported || 0).toLocaleString()}</span><span class="result-stat-label">total ${actionVerb}</span>`;
           if (r.stats_imported_start && r.stats_imported_end) {
             const range = `${this._formatTs(r.stats_imported_start)} \u2192 ${this._formatTs(r.stats_imported_end)}`;
             grid += `<span class="result-stat-range" style="grid-column:1/-1">${range}</span>`;
@@ -1100,7 +1123,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             grid += `<span class="result-stat-value">${r.stats_short_already_covered.toLocaleString()}</span><span class="result-stat-label">already complete in destination</span>`;
           if (r.stats_short_skipped_recent > 0)
             grid += `<span class="result-stat-value">${r.stats_short_skipped_recent.toLocaleString()}</span><span class="result-stat-label">skipped (too recent or under threshold)</span>`;
-          grid += `<span class="result-stat-value">${(r.stats_short_imported || 0).toLocaleString()}</span><span class="result-stat-label">imported</span>`;
+          grid += `<span class="result-stat-value">${(r.stats_short_imported || 0).toLocaleString()}</span><span class="result-stat-label">${actionVerb}</span>`;
           if (r.stats_short_imported_start && r.stats_short_imported_end) {
             const range = `${this._formatTs(r.stats_short_imported_start)} \u2192 ${this._formatTs(r.stats_short_imported_end)}`;
             grid += `<span class="result-stat-range" style="grid-column:1/-1">${range}</span>`;
