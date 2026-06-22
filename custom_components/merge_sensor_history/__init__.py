@@ -67,18 +67,30 @@ def _hash_panel_file(panel_path: str) -> str:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Merge Sensor History from a config entry."""
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN].setdefault("_locks", {})
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    domain_data.setdefault("_locks", {})
 
-    # Register the panel with cache-busting hash.
-    # File I/O must run in an executor — HA flags sync open() inside the
-    # event loop as a blocking call.
-    panel_path = os.path.join(os.path.dirname(__file__), "frontend", "panel.js")
+    # Register the static asset path + sidebar panel. If either step fails we
+    # let the exception propagate so the config entry fails to set up — HA shows
+    # "Failed to set up" and logs the full traceback, prompting the user to
+    # report it — rather than loading in a degraded, panel-less state.
+    frontend_dir = os.path.join(os.path.dirname(__file__), "frontend")
+    panel_path = os.path.join(frontend_dir, "panel.js")
+
+    # Serve the whole frontend directory (HA's documented pattern) so panel.js
+    # is reachable at /<DOMAIN>/panel.js. Static paths can't be unregistered, so
+    # register at most once per process to avoid stacking a duplicate route on a
+    # config-entry reload.
+    if not domain_data.get("_static_path_registered"):
+        await hass.http.async_register_static_paths(
+            [StaticPathConfig(f"/{DOMAIN}", frontend_dir, cache_headers=True)]
+        )
+        domain_data["_static_path_registered"] = True
+
+    # Cache-busting hash so browsers reload panel.js after an update.
+    # File I/O runs in an executor — HA flags a sync open() in the event loop
+    # as a blocking call.
     panel_hash = await hass.async_add_executor_job(_hash_panel_file, panel_path)
-
-    await hass.http.async_register_static_paths(
-        [StaticPathConfig(f"/{DOMAIN}/panel.js", panel_path, cache_headers=True)]
-    )
 
     async_register_built_in_panel(
         hass,
@@ -95,6 +107,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         },
         require_admin=True,
     )
+    domain_data["_panel_registered"] = True
 
     # Register websocket commands
     websocket_api.async_register_command(hass, ws_import_history)
@@ -147,9 +160,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    async_remove_panel(hass, "merge-sensor-history")
+    domain_data = hass.data.get(DOMAIN, {})
+
+    # Mirror setup: remove the panel we registered (and clear its flag so the
+    # next setup re-registers it).
+    if domain_data.pop("_panel_registered", None):
+        async_remove_panel(hass, "merge-sensor-history")
+
     hass.services.async_remove(DOMAIN, "import_history")
-    hass.data.pop(DOMAIN, None)
+
+    # Intentionally keep hass.data[DOMAIN]: the static asset path registered in
+    # async_setup_entry cannot be unregistered (no HA/aiohttp API), so it lives
+    # for the process lifetime. Preserving the `_static_path_registered` guard
+    # stops a later reload from stacking a duplicate route.
     return True
 
 
