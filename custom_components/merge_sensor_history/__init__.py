@@ -37,6 +37,13 @@ try:
     from homeassistant.components.recorder.models import StatisticMeanType
 except ImportError:
     StatisticMeanType = None  # type: ignore[assignment,misc]
+
+try:
+    from homeassistant.components.recorder.statistics import (
+        STATISTIC_UNIT_TO_UNIT_CONVERTER,
+    )
+except ImportError:  # pragma: no cover - older HA without the converter map
+    STATISTIC_UNIT_TO_UNIT_CONVERTER = {}  # type: ignore[assignment]
 from homeassistant.components.recorder.db_schema import (
     States,
     StateAttributes,
@@ -57,6 +64,22 @@ _EPOCH = datetime(2000, 1, 1, tzinfo=timezone.utc)
 # State values that HA hides in the History panel — also excluded from
 # gap-detection so a long unavailable streak registers as a fillable gap.
 _NON_GOOD_STATES = frozenset({"unavailable", "unknown"})
+
+
+def _ensure_unit_class(metadata: dict[str, Any]) -> None:
+    """Populate ``unit_class`` on import metadata when it is absent.
+
+    Home Assistant 2026.11 makes ``unit_class`` mandatory for
+    ``async_import_statistics``; omitting it currently emits a deprecation
+    warning. We derive it from the unit of measurement using the same converter
+    mapping HA applies internally, falling back to ``None`` for units with no
+    associated converter (matching HA's own behaviour).
+    """
+    if "unit_class" in metadata:
+        return
+    unit = metadata.get("unit_of_measurement")
+    converter = STATISTIC_UNIT_TO_UNIT_CONVERTER.get(unit)
+    metadata["unit_class"] = converter.UNIT_CLASS if converter is not None else None
 
 
 def _hash_panel_file(panel_path: str) -> str:
@@ -1297,6 +1320,7 @@ async def _async_import_statistics_for_pair(
         metadata = StatisticMetaData(**meta_kwargs)
 
     out["stats_unit"] = unit
+    _ensure_unit_class(metadata)
 
     # -- Build StatisticData entries --
     # data dicts already have sum_offset applied (during merge/partition) and
@@ -1568,6 +1592,8 @@ async def _async_import_short_term_statistics_for_pair(
         else:
             meta_kwargs["has_mean"] = has_mean
         metadata = StatisticMetaData(**meta_kwargs)
+
+    _ensure_unit_class(metadata)
 
     # -- Build StatisticData entries --
     stats_data = []
