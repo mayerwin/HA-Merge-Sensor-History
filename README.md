@@ -64,6 +64,8 @@ HA does **not** regenerate statistics from states retroactively. Both are import
 6. Click **Import History**
 7. Review the results — each pair shows how many states and statistics were imported
 
+> **Energy & cost are separate sensors.** In the Energy dashboard, a sensor's consumption and its *cost* are tracked by two different entities. If you migrate only the energy sensor, the new sensor's past **cost will show `0`**. To bring the cost history across too, add a **second pair** for the cost sensors (old cost → new cost). The same applies to any other derived sensor (e.g. compensated/return energy).
+
 ### Service call
 
 You can also call the service directly from Developer Tools or automations:
@@ -81,6 +83,7 @@ data:
 - Only data **still in the recorder** can be imported. States are purged by default after ~10 days. Long-term statistics (hourly) are kept indefinitely.
 - After importing, the new history will appear in the **History** panel. You may need to refresh the page or wait for the next recorder cycle.
 - The import is a **one-time operation**, not a continuous sync. Run it once after setting up your new sensors.
+- **Cost is a separate sensor from energy.** Pair the cost sensors too if you want their history (see the note under [Usage](#sidebar-panel)) — migrating only the energy sensor leaves past cost at `0`.
 
 ## Requirements
 

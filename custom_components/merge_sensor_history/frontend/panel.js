@@ -542,7 +542,8 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         </div>
         <p class="subtitle">
           Import historical data from source sensors into destination sensors.<br/>
-          Only data older than the destination's oldest record will be imported &mdash; no duplicates.
+          Only data older than the destination's oldest record will be imported &mdash; no duplicates.<br/>
+          <strong>Tip:</strong> energy and its cost are tracked by <em>separate</em> sensors &mdash; add a pair for each, or past cost stays at 0.
         </p>
         <div class="warning-banner">
           <span class="warn-icon">&#9888;</span>
