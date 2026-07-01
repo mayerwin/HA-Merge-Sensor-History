@@ -84,6 +84,7 @@ data:
 - After importing, the new history will appear in the **History** panel. You may need to refresh the page or wait for the next recorder cycle.
 - The import is a **one-time operation**, not a continuous sync. Run it once after setting up your new sensors.
 - **Cost is a separate sensor from energy.** Pair the cost sensors too if you want their history (see the note under [Usage](#sidebar-panel)) — migrating only the energy sensor leaves past cost at `0`.
+- **Energy sensors — the very first imported hour.** When you import older energy history in front of a destination that *already has* statistics, the integration shifts the imported cumulative `sum` so it lines up with your existing data at the boundary (no jump at the splice point). Home Assistant measures each hour's energy as the difference between consecutive cumulative totals and anchors the very first hour against zero — and it does **no** meter-reset detection when reading stored statistics — so the single **oldest imported hour** ends up absorbing that alignment offset. Your **hourly and daily energy graphs are unaffected** (Home Assistant clamps that one hour to zero), but the **all-time total in the Energy _sources table_** can be off by the offset amount. If you want a perfect lifetime total, correct that one hour under **Developer Tools → Statistics** (use *Adjust a statistic* / *Fix* on the first data point). Importing into a brand-new sensor *before* it has compiled any statistics avoids this entirely, since there is nothing to align against.
 
 ## Requirements
 

@@ -1083,6 +1083,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           if (r.stats_sum_offset !== null && r.stats_sum_offset !== undefined) {
             const offsetStr = this._formatOffset(r.stats_sum_offset, r.stats_unit);
             grid += `<span class="result-stat-range" style="grid-column:1/-1">Cumulative-sum offset applied: <strong>${offsetStr}</strong> (aligns energy totals at splice point)</span>`;
+            grid += `<span class="result-stat-range" style="grid-column:1/-1">The oldest imported hour absorbs this offset, so it can show a one-off value in the Energy dashboard's all-time total. Your hourly/daily usage graph is unaffected; correct that single hour under Developer Tools → Statistics if you want a perfect lifetime total.</span>`;
           }
           if (r.stats_error)
             grid += `<span class="result-stat-error">Error: ${r.stats_error}</span>`;
