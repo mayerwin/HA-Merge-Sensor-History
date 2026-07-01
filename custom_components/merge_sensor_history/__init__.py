@@ -318,7 +318,8 @@ async def _async_import_pair(
         "stats_gap_filled": 0,
         "stats_imported_start": None,  # ISO datetime (hour start) of first imported stat
         "stats_imported_end": None,  # ISO datetime (hour start) of last imported stat
-        "stats_sum_offset": None,  # Applied offset value (or None)
+        "stats_sum_offset": None,  # Applied splice offset (or None) — set only when NOT realigned
+        "stats_realigned_by": None,  # Amount the dest running total was lifted (or None)
         "stats_unit": None,  # Unit of measurement for display
         # Short-term statistics (5-minute) — populated only when fill_gaps=True
         "stats_short_source_total": 0,
@@ -506,6 +507,49 @@ async def _do_import(
                 exc,
             )
             result["stats_short_error"] = str(exc)
+
+    # --- 5. Realign the destination series for a clean head-fill energy import ---
+    # See the "series realignment" note in _async_import_statistics_for_pair.
+    # Queued last so it runs on the recorder thread AFTER the import tasks commit,
+    # lifting every row (imported + existing + future) by the same constant. We
+    # skip it if short-term rows were imported this run, since a blanket lift would
+    # break the level of those recently gap-filled short-term slots — in that case
+    # the splice offset stays applied and we report it (with the first-hour caveat).
+    realign = result.pop("_realign", None)
+    if realign:
+        original_offset = -float(realign["adjustment"])
+        if result.get("stats_short_imported", 0):
+            result["stats_realigned_by"] = None
+            result["stats_sum_offset"] = original_offset
+        else:
+            try:
+                start_dt = datetime.fromtimestamp(
+                    realign["start_ts"], tz=timezone.utc
+                )
+                recorder.async_adjust_statistics(
+                    dest_id,
+                    start_dt,
+                    float(realign["adjustment"]),
+                    realign["unit"],
+                )
+                _LOGGER.info(
+                    "Realigned %s: lifted cumulative sum by %s from %s so the "
+                    "imported history joins the existing series with a correct "
+                    "first hour",
+                    dest_id,
+                    realign["adjustment"],
+                    start_dt.isoformat(),
+                )
+            except Exception as exc:
+                _LOGGER.warning(
+                    "Sum realignment failed for %s (splice offset remains "
+                    "applied): %s",
+                    dest_id,
+                    exc,
+                )
+                result["stats_realign_error"] = str(exc)
+                result["stats_realigned_by"] = None
+                result["stats_sum_offset"] = original_offset
 
 
 def _insert_states_atomic(
@@ -1348,6 +1392,42 @@ async def _async_import_statistics_for_pair(
     ).isoformat()
     if sum_offset is not None:
         out["stats_sum_offset"] = sum_offset
+
+    # --- Plan a series realignment for a clean head-fill energy import ---
+    # When every imported sum row is OLDER than the destination's oldest existing
+    # sum row, we've extended the cumulative series backwards. HA anchors the very
+    # first point of a sum series against 0 and does NO reset detection when reading
+    # stored statistics, so the oldest imported hour would otherwise display the
+    # whole splice offset as a one-off value (and skew the lifetime total in the
+    # Energy sources table). Instead of leaving the imported series shifted down to
+    # meet the destination (which pushes that offset onto the first hour), we lift
+    # the ENTIRE series — imported rows, the destination's existing rows, and all
+    # future compiled rows — by -offset via HA's official adjust API. The oldest
+    # hour then reads its true value and old/new join seamlessly. The adjust itself
+    # is queued in _do_import, after the imports, and only when no short-term rows
+    # were imported (a blanket lift could otherwise disrupt recently gap-filled
+    # short-term slots). A re-run recomputes a ~zero offset against the now-aligned
+    # destination, so this stays idempotent.
+    if sum_offset is not None:
+        dest_sum_ts = [
+            _row_start_ts(r) for r in dest_rows if r.get("sum") is not None
+        ]
+        imported_sum_ts = [ts for ts, data in to_import_rows if "sum" in data]
+        if (
+            dest_sum_ts
+            and imported_sum_ts
+            and max(imported_sum_ts) < min(dest_sum_ts)
+        ):
+            out["_realign"] = {
+                "start_ts": min(imported_sum_ts),
+                "adjustment": -sum_offset,  # positive lift for the common case
+                "unit": unit,
+            }
+            # The splice offset is undone by the lift, so report the net effect
+            # (a positive lift of the running total), not the raw offset, and drop
+            # the "first hour may be off" caveat.
+            out["stats_sum_offset"] = None
+            out["stats_realigned_by"] = -sum_offset
 
     _LOGGER.info(
         "Queued %d statistics rows for %s "
