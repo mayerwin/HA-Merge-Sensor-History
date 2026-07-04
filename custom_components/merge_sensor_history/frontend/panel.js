@@ -1080,11 +1080,16 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             const range = `${this._formatTs(r.stats_imported_start)} \u2192 ${this._formatTs(r.stats_imported_end)}`;
             grid += `<span class="result-stat-range" style="grid-column:1/-1">${range}</span>`;
           }
-          if (r.stats_sum_offset !== null && r.stats_sum_offset !== undefined) {
+          if (r.stats_realigned_by !== null && r.stats_realigned_by !== undefined) {
+            const liftStr = this._formatOffset(r.stats_realigned_by, r.stats_unit);
+            grid += `<span class="result-stat-range" style="grid-column:1/-1">Destination running total realigned by <strong>${liftStr}</strong> so the imported history and existing data form one continuous energy series. The oldest hour is correct and no manual fix is needed.</span>`;
+          } else if (r.stats_sum_offset !== null && r.stats_sum_offset !== undefined) {
             const offsetStr = this._formatOffset(r.stats_sum_offset, r.stats_unit);
             grid += `<span class="result-stat-range" style="grid-column:1/-1">Cumulative-sum offset applied: <strong>${offsetStr}</strong> (aligns energy totals at splice point)</span>`;
             grid += `<span class="result-stat-range" style="grid-column:1/-1">The oldest imported hour absorbs this offset, so it can show a one-off value in the Energy dashboard's all-time total. Your hourly/daily usage graph is unaffected; correct that single hour under Developer Tools → Statistics if you want a perfect lifetime total.</span>`;
           }
+          if (r.stats_realign_error)
+            grid += `<span class="result-stat-error">Realignment failed: ${r.stats_realign_error}</span>`;
           if (r.stats_error)
             grid += `<span class="result-stat-error">Error: ${r.stats_error}</span>`;
         }
