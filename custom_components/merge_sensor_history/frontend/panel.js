@@ -1129,7 +1129,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             </div>
             <div class="result-details">
               ${r.error}<br/>
-              <em>No data was written &mdash; the import was rolled back.</em>
+              <em>No data was written &mdash; ${r.dry_run ? "this was a preview only." : "the import was rolled back."}</em>
             </div>
           </div>`;
         }
@@ -1211,10 +1211,12 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           }
           if (r.stats_realigned_by !== null && r.stats_realigned_by !== undefined) {
             const liftStr = this._formatOffset(r.stats_realigned_by, r.stats_unit);
-            grid += `<span class="result-stat-range" style="grid-column:1/-1">Destination running total realigned by <strong>${liftStr}</strong> so the imported history and existing data form one continuous energy series. The oldest hour is correct and no manual fix is needed.</span>`;
+            grid += r.dry_run
+              ? `<span class="result-stat-range" style="grid-column:1/-1">Destination running total would be realigned by <strong>${liftStr}</strong> so the imported history and existing data form one continuous energy series.</span>`
+              : `<span class="result-stat-range" style="grid-column:1/-1">Destination running total realigned by <strong>${liftStr}</strong> so the imported history and existing data form one continuous energy series. The oldest hour is correct and no manual fix is needed.</span>`;
           } else if (r.stats_sum_offset !== null && r.stats_sum_offset !== undefined) {
             const offsetStr = this._formatOffset(r.stats_sum_offset, r.stats_unit);
-            grid += `<span class="result-stat-range" style="grid-column:1/-1">Cumulative-sum offset applied: <strong>${offsetStr}</strong> (aligns energy totals at splice point)</span>`;
+            grid += `<span class="result-stat-range" style="grid-column:1/-1">Cumulative-sum offset ${r.dry_run ? "would be applied" : "applied"}: <strong>${offsetStr}</strong> (aligns energy totals at splice point)</span>`;
             grid += `<span class="result-stat-range" style="grid-column:1/-1">The oldest imported hour absorbs this offset, so it can show a one-off value in the Energy dashboard's all-time total. Your hourly/daily usage graph is unaffected; correct that single hour under Developer Tools → Statistics if you want a perfect lifetime total.</span>`;
           }
           if (r.stats_realign_error)

@@ -536,6 +536,14 @@ async def _do_import(
         if result.get("stats_short_imported", 0):
             result["stats_realigned_by"] = None
             result["stats_sum_offset"] = original_offset
+        elif dry_run:
+            # Preview: stats_realigned_by is already set for display ("would be
+            # realigned"); skip the actual adjustment queueing.
+            _LOGGER.info(
+                "Dry run: would realign %s by lifting cumulative sum by %s",
+                dest_id,
+                realign["adjustment"],
+            )
         else:
             try:
                 start_dt = datetime.fromtimestamp(
