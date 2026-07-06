@@ -94,9 +94,35 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           flex-shrink: 0;
           margin-top: 1px;
         }
-        .filter-row {
+        .filter-area {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          flex-wrap: wrap;
           margin-bottom: 16px;
+        }
+        .filter-row {
           position: relative;
+          flex: 1;
+          min-width: 200px;
+        }
+        .filter-mode-toggle {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          font-size: 12px;
+          color: var(--secondary-text-color);
+          cursor: pointer;
+          white-space: nowrap;
+          flex-shrink: 0;
+          user-select: none;
+        }
+        .filter-mode-toggle input[type="checkbox"] {
+          width: 15px;
+          height: 15px;
+          accent-color: var(--primary-color, #03a9f4);
+          cursor: pointer;
+          margin: 0;
         }
         .filter-row input {
           width: 100%;
@@ -369,24 +395,36 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           margin-bottom: 16px;
         }
         .bulk-toggle {
-          background: none;
-          border: none;
-          color: var(--primary-color, #03a9f4);
-          font-size: 13px;
+          width: 100%;
+          box-sizing: border-box;
+          background: var(--secondary-background-color, #f5f5f5);
+          border: 1px solid var(--divider-color, #e0e0e0);
+          border-radius: 10px;
+          color: var(--primary-text-color);
+          font-size: 14px;
+          font-weight: 500;
           cursor: pointer;
-          padding: 4px 0;
+          padding: 12px 16px;
           display: flex;
           align-items: center;
-          gap: 6px;
+          gap: 10px;
           font-family: inherit;
+          transition: border-color 0.2s;
         }
         .bulk-toggle:hover {
-          text-decoration: underline;
+          border-color: color-mix(in srgb, var(--primary-color, #03a9f4) 45%, transparent);
         }
         .bulk-toggle .chevron {
           display: inline-block;
           transition: transform 0.2s;
           font-size: 10px;
+          color: var(--primary-color, #03a9f4);
+        }
+        .bulk-subtitle {
+          margin-left: auto;
+          font-size: 12px;
+          font-weight: 400;
+          color: var(--secondary-text-color);
         }
         .bulk-toggle .chevron.open {
           transform: rotate(90deg);
@@ -451,6 +489,17 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           font-size: 12px;
         }
 
+        .pair-actions {
+          margin-top: 2px;
+        }
+        .options-title {
+          font-size: 11px;
+          font-weight: 600;
+          letter-spacing: 0.8px;
+          text-transform: uppercase;
+          color: var(--secondary-text-color);
+          margin-bottom: 10px;
+        }
         .options-section {
           margin-top: 14px;
           padding: 14px 16px;
@@ -553,14 +602,11 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             Imported states will appear in history graphs after the next recorder refresh.
           </span>
         </div>
-        <div class="filter-row">
-          <span class="search-icon">&#128269;</span>
-          <input type="text" id="entity-filter" placeholder="Filter entities by name or ID..." />
-        </div>
         <div class="bulk-section">
           <button class="bulk-toggle" id="bulk-toggle">
             <span class="chevron" id="bulk-chevron">&#9654;</span>
             Bulk add pairs
+            <span class="bulk-subtitle">paste a list of source &#8594; destination pairs</span>
           </button>
           <div class="bulk-body" id="bulk-body">
             <textarea id="bulk-textarea" placeholder="sensor.old_temp, sensor.new_temp&#10;sensor.old_humidity&#9;sensor.new_humidity&#10;..."></textarea>
@@ -573,8 +619,30 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             <div id="bulk-error"></div>
           </div>
         </div>
+        <div class="filter-area">
+          <div class="filter-row" id="single-filter-row">
+            <span class="search-icon">&#128269;</span>
+            <input type="text" id="entity-filter" placeholder="Filter entities by name or ID..." />
+          </div>
+          <div class="filter-row" id="source-filter-row" style="display:none">
+            <span class="search-icon">&#128269;</span>
+            <input type="text" id="source-filter" placeholder="Filter source entities..." />
+          </div>
+          <div class="filter-row" id="dest-filter-row" style="display:none">
+            <span class="search-icon">&#128269;</span>
+            <input type="text" id="dest-filter" placeholder="Filter destination entities..." />
+          </div>
+          <label class="filter-mode-toggle" title="When checked, one filter narrows both dropdowns. Uncheck to filter the source and destination lists separately &mdash; handy when only a serial number differs between the old and new sensors.">
+            <input type="checkbox" id="shared-filter-cb" checked />
+            Same filter for both
+          </label>
+        </div>
         <div id="pairs-container"></div>
+        <div class="pair-actions">
+          <button class="btn btn-secondary" id="add-pair-btn">+ Add Pair</button>
+        </div>
         <div class="options-section">
+          <div class="options-title">Options</div>
           <label class="option-row" title="By default, only data older than the destination's oldest existing entry is imported, to avoid duplicates. Enable this to also fill quiet periods inside the destination's existing time range.">
             <input type="checkbox" id="fill-gaps-cb" />
             <span class="option-label">Fill mid-stream gaps in the destination's existing time range</span>
@@ -587,7 +655,6 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           </div>
         </div>
         <div class="actions">
-          <button class="btn btn-secondary" id="add-pair-btn">+ Add Pair</button>
           <div style="flex:1"></div>
           <button class="btn btn-primary" id="import-btn">Import History</button>
         </div>
@@ -599,6 +666,12 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     this._resultsContainer = shadow.getElementById("results-container");
     this._importBtn = shadow.getElementById("import-btn");
     this._filterInput = shadow.getElementById("entity-filter");
+    this._sourceFilterInput = shadow.getElementById("source-filter");
+    this._destFilterInput = shadow.getElementById("dest-filter");
+    this._sharedFilterCb = shadow.getElementById("shared-filter-cb");
+    this._singleFilterRow = shadow.getElementById("single-filter-row");
+    this._sourceFilterRow = shadow.getElementById("source-filter-row");
+    this._destFilterRow = shadow.getElementById("dest-filter-row");
     this._bulkBody = shadow.getElementById("bulk-body");
     this._bulkChevron = shadow.getElementById("bulk-chevron");
     this._bulkTextarea = shadow.getElementById("bulk-textarea");
@@ -624,7 +697,30 @@ class MergeSensorsHistoryPanel extends HTMLElement {
 
     this._importBtn.addEventListener("click", () => this._doImport());
 
-    this._filterInput.addEventListener("input", () => {
+    for (const el of [
+      this._filterInput,
+      this._sourceFilterInput,
+      this._destFilterInput,
+    ]) {
+      el.addEventListener("input", () => {
+        this._renderPairs();
+      });
+    }
+
+    this._sharedFilterCb.addEventListener("change", () => {
+      const shared = this._sharedFilterCb.checked;
+      this._singleFilterRow.style.display = shared ? "" : "none";
+      this._sourceFilterRow.style.display = shared ? "none" : "";
+      this._destFilterRow.style.display = shared ? "none" : "";
+      if (shared) {
+        // Collapsing back: carry the source filter into the shared field.
+        this._filterInput.value = this._sourceFilterInput.value;
+      } else {
+        // Splitting: seed both filters from the shared value so nothing
+        // changes until the user edits one of them.
+        this._sourceFilterInput.value = this._filterInput.value;
+        this._destFilterInput.value = this._filterInput.value;
+      }
       this._renderPairs();
     });
 
@@ -646,9 +742,15 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     this._renderPairs();
   }
 
-  _getFilteredEntities() {
+  _getFilteredEntities(role) {
     if (!this._hass) return [];
-    const filter = (this._filterInput?.value || "").toLowerCase();
+    const shared = !this._sharedFilterCb || this._sharedFilterCb.checked;
+    const input = shared
+      ? this._filterInput
+      : role === "destination"
+        ? this._destFilterInput
+        : this._sourceFilterInput;
+    const filter = (input?.value || "").toLowerCase();
     const entities = Object.keys(this._hass.states).sort();
     if (!filter) return entities;
     return entities.filter((e) => {
@@ -677,7 +779,11 @@ class MergeSensorsHistoryPanel extends HTMLElement {
   }
 
   _renderPairs() {
-    const entities = this._getFilteredEntities();
+    const sourceEntities = this._getFilteredEntities("source");
+    const destEntities =
+      !this._sharedFilterCb || this._sharedFilterCb.checked
+        ? sourceEntities
+        : this._getFilteredEntities("destination");
     const container = this._pairsContainer;
     container.innerHTML = "";
 
@@ -691,7 +797,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       const sourceLabel = document.createElement("label");
       sourceLabel.textContent = "Source (old sensor)";
       const sourceSelect = document.createElement("select");
-      sourceSelect.innerHTML = this._buildOptions(entities, pair.source);
+      sourceSelect.innerHTML = this._buildOptions(sourceEntities, pair.source);
 
       const sourceInfo = document.createElement("div");
       sourceInfo.className = "entity-info";
@@ -716,7 +822,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       const destLabel = document.createElement("label");
       destLabel.textContent = "Destination (new sensor)";
       const destSelect = document.createElement("select");
-      destSelect.innerHTML = this._buildOptions(entities, pair.destination);
+      destSelect.innerHTML = this._buildOptions(destEntities, pair.destination);
 
       const destInfo = document.createElement("div");
       destInfo.className = "entity-info";
