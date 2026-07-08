@@ -662,6 +662,15 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             <span class="option-unit">minutes</span>
             <span class="option-hint">&mdash; a gap is any period this long where the destination has no state but the source does</span>
           </div>
+          <label class="option-row" style="margin-top:14px" title="Multiply every numeric value read from the source (states and statistics) by a constant before importing. Use when the two sensors record the same quantity in different units.">
+            <input type="checkbox" id="scale-cb" />
+            <span class="option-label">Apply a scaling factor to imported values</span>
+          </label>
+          <div class="option-row sub-row" id="scale-factor-row">
+            <span class="option-label">Multiply by:</span>
+            <input type="number" id="scale-factor" step="any" min="0" value="1000" />
+            <span class="option-hint">&mdash; e.g. 1000 for kWh &rarr; Wh, or 0.001 for Wh &rarr; kWh. Applied to states and statistics; energy totals are spliced after conversion. Non-numeric states are left unchanged.</span>
+          </div>
         </div>
         <div class="actions">
           <div style="flex:1"></div>
@@ -690,6 +699,9 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     this._fillGapsCb = shadow.getElementById("fill-gaps-cb");
     this._gapThreshold = shadow.getElementById("gap-threshold");
     this._gapThresholdRow = shadow.getElementById("gap-threshold-row");
+    this._scaleCb = shadow.getElementById("scale-cb");
+    this._scaleFactor = shadow.getElementById("scale-factor");
+    this._scaleFactorRow = shadow.getElementById("scale-factor-row");
 
     const syncGapThresholdEnabled = () => {
       this._gapThresholdRow.classList.toggle(
@@ -700,6 +712,16 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     };
     syncGapThresholdEnabled();
     this._fillGapsCb.addEventListener("change", syncGapThresholdEnabled);
+
+    const syncScaleEnabled = () => {
+      this._scaleFactorRow.classList.toggle(
+        "disabled",
+        !this._scaleCb.checked
+      );
+      this._scaleFactor.disabled = !this._scaleCb.checked;
+    };
+    syncScaleEnabled();
+    this._scaleCb.addEventListener("change", syncScaleEnabled);
 
     shadow.getElementById("add-pair-btn").addEventListener("click", () => {
       this._pairs.push({ source: "", destination: "" });
@@ -973,6 +995,18 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       gapThresholdMinutes = 60;
     }
 
+    const scaleEnabled = this._scaleCb.checked;
+    let scaleFactor = null;
+    if (scaleEnabled) {
+      scaleFactor = parseFloat(this._scaleFactor.value);
+      if (!Number.isFinite(scaleFactor) || scaleFactor <= 0) {
+        alert(
+          "Scaling factor must be a positive number (e.g. 1000 for kWh \u2192 Wh, 0.001 for Wh \u2192 kWh)."
+        );
+        return;
+      }
+    }
+
     if (!dryRun) {
       const pairLines = validPairs
         .map((p) => {
@@ -988,11 +1022,17 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         ? `\n\nMid-stream & trailing gap-fill: ON (threshold ${gapThresholdMinutes} min)`
         : "";
 
+      const scaleLine =
+        scaleFactor !== null && scaleFactor !== 1
+          ? `\n\nScaling factor: \u00d7${scaleFactor} (every imported value is multiplied)`
+          : "";
+
       if (
         !confirm(
           `Import history for ${validPairs.length} pair(s)?\n\n` +
             pairLines +
             gapsLine +
+            scaleLine +
             "\n\nThis will write to your recorder database."
         )
       ) {
@@ -1017,6 +1057,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         fill_gaps: fillGaps,
         gap_threshold_minutes: gapThresholdMinutes,
         dry_run: dryRun,
+        scale_factor: scaleFactor,
       });
 
       this._renderResults(response.results);
@@ -1161,6 +1202,11 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           count > 0
             ? `<button class="debug-dl-btn" data-pair="${pairKey}" data-kind="${kind}" title="Download per-row debug JSON for this section">&#x2B07; debug JSON (${count.toLocaleString()} rows)</button>`
             : "";
+
+        // --- Scaling factor notice ---
+        if (r.scale_factor !== null && r.scale_factor !== undefined) {
+          grid += `<span class="result-stat-range" style="grid-column:1/-1">Scaling factor ${r.dry_run ? "to be applied" : "applied"}: <strong>&times;${r.scale_factor}</strong> &mdash; every numeric source value ${r.dry_run ? "will be" : "was"} multiplied before import.</span>`;
+        }
 
         // --- States summary ---
         if (r.states_source_total > 0) {

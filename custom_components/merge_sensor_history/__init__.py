@@ -66,6 +66,42 @@ _EPOCH = datetime(2000, 1, 1, tzinfo=timezone.utc)
 _NON_GOOD_STATES = frozenset({"unavailable", "unknown"})
 
 
+def _scale_state_value(value: str | None, factor: float) -> str | None:
+    """Multiply a numeric state string by `factor`; pass others through.
+
+    Non-numeric states (text sensors, unavailable/unknown) are returned
+    unchanged. %.10g keeps enough precision for energy counters while
+    avoiding float-repr noise like 0.30000000000000004.
+    """
+    if value is None or value in _NON_GOOD_STATES:
+        return value
+    try:
+        return f"{float(value) * factor:.10g}"
+    except (ValueError, TypeError):
+        return value
+
+
+def _scale_stat_rows(rows: list[dict], factor: float | None) -> list[dict]:
+    """Return copies of statistics rows with numeric columns multiplied by
+    `factor` (mean/min/max/sum/state). Timestamps and last_reset untouched.
+
+    Scaling happens BEFORE the sum-offset / splice computations so that the
+    offset joining the imported series to the destination is computed in the
+    destination's (scaled) value space.
+    """
+    if factor is None:
+        return rows
+    scaled = []
+    for row in rows:
+        row2 = dict(row)
+        for key in ("mean", "min", "max", "sum", "state"):
+            value = row2.get(key)
+            if value is not None:
+                row2[key] = float(value) * factor
+        scaled.append(row2)
+    return scaled
+
+
 def _ensure_unit_class(metadata: dict[str, Any]) -> None:
     """Populate ``unit_class`` on import metadata when it is absent.
 
@@ -142,12 +178,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         dest = call.data["destination_entity_id"]
         fill_gaps = bool(call.data.get("fill_gaps", False))
         gap_threshold_minutes = int(call.data.get("gap_threshold_minutes", 60))
+        scale_factor = call.data.get("scale_factor")
+        if scale_factor is not None and scale_factor == 1.0:
+            scale_factor = None
         result = await _async_import_pair(
             hass,
             source,
             dest,
             fill_gaps=fill_gaps,
             gap_threshold_minutes=gap_threshold_minutes,
+            scale_factor=scale_factor,
         )
         if result["error"]:
             _LOGGER.error(
@@ -173,6 +213,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 vol.Optional("fill_gaps", default=False): cv.boolean,
                 vol.Optional("gap_threshold_minutes", default=60): vol.All(
                     vol.Coerce(int), vol.Range(min=1, max=1440)
+                ),
+                vol.Optional("scale_factor"): vol.All(
+                    vol.Coerce(float), vol.Range(min=1e-12)
                 ),
             }
         ),
@@ -220,6 +263,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             vol.Coerce(int), vol.Range(min=1, max=1440)
         ),
         vol.Optional("dry_run", default=False): bool,
+        vol.Optional("scale_factor", default=None): vol.Any(
+            None, vol.All(vol.Coerce(float), vol.Range(min=1e-12))
+        ),
     }
 )
 @websocket_api.async_response
@@ -231,6 +277,10 @@ async def ws_import_history(
     fill_gaps = bool(msg.get("fill_gaps", False))
     gap_threshold_minutes = int(msg.get("gap_threshold_minutes", 60))
     dry_run = bool(msg.get("dry_run", False))
+    scale_factor = msg.get("scale_factor")
+    # A factor of exactly 1 is a no-op — treat it as disabled.
+    if scale_factor is not None and scale_factor == 1.0:
+        scale_factor = None
     results = []
 
     for pair in pairs:
@@ -241,6 +291,7 @@ async def ws_import_history(
             fill_gaps=fill_gaps,
             gap_threshold_minutes=gap_threshold_minutes,
             dry_run=dry_run,
+            scale_factor=scale_factor,
         )
         results.append(
             {
@@ -278,6 +329,7 @@ async def _async_import_pair(
     fill_gaps: bool = False,
     gap_threshold_minutes: int = 60,
     dry_run: bool = False,
+    scale_factor: float | None = None,
 ) -> dict[str, Any]:
     """Import all history from source entity into destination entity.
 
@@ -303,9 +355,18 @@ async def _async_import_pair(
     When `dry_run` is True:
     - Calculates all changes but does not write to the database.
 
+    When `scale_factor` is set (a positive float), every numeric value read
+    from the source (state strings and statistics mean/min/max/sum/state) is
+    multiplied by it before being considered for import — for merging sensors
+    that record the same quantity in different units (e.g. 1000 for kWh -> Wh,
+    0.001 for Wh -> kWh). Scaling happens before the cumulative-sum splice
+    offset is computed, so energy series join correctly in the destination's
+    value space.
+
     Returns a dict with result details for the UI.
     """
     result: dict[str, Any] = {
+        "scale_factor": scale_factor,  # echoed for display (None = off)
         # States
         "states_source_total": 0,
         "states_source_skipped_non_good": 0,  # unavailable/unknown source rows
@@ -371,6 +432,7 @@ async def _async_import_pair(
                 fill_gaps=fill_gaps,
                 gap_threshold_minutes=gap_threshold_minutes,
                 dry_run=dry_run,
+                scale_factor=scale_factor,
             )
         except Exception as exc:
             _LOGGER.exception(
@@ -393,6 +455,7 @@ async def _do_import(
     fill_gaps: bool = False,
     gap_threshold_minutes: int = 60,
     dry_run: bool = False,
+    scale_factor: float | None = None,
 ) -> None:
     """Execute the actual import. Separated for clean lock/error handling."""
     recorder = get_instance(hass)
@@ -456,6 +519,7 @@ async def _do_import(
             fill_gaps=fill_gaps,
             gap_threshold_minutes=gap_threshold_minutes,
             dry_run=dry_run,
+            scale_factor=scale_factor,
         )
     )
     result["states_imported"] = imported
@@ -486,7 +550,7 @@ async def _do_import(
     # Done independently: a stats failure should not hide a successful states import.
     try:
         stats_result = await _async_import_statistics_for_pair(
-            hass, source_id, dest_id, dry_run=dry_run
+            hass, source_id, dest_id, dry_run=dry_run, scale_factor=scale_factor
         )
         result.update(stats_result)
     except Exception as exc:
@@ -512,6 +576,7 @@ async def _do_import(
                 dest_id,
                 gap_threshold_minutes=gap_threshold_minutes,
                 dry_run=dry_run,
+                scale_factor=scale_factor,
             )
             result.update(short_result)
         except Exception as exc:
@@ -583,6 +648,7 @@ def _insert_states_atomic(
     fill_gaps: bool = False,
     gap_threshold_minutes: int = 60,
     dry_run: bool = False,
+    scale_factor: float | None = None,
 ) -> tuple[
     int,
     int,
@@ -677,21 +743,23 @@ def _insert_states_atomic(
         if min_ts is None:
             to_import = list(source_states)
             for s in source_states:
-                debug_records.append(
-                    {
-                        "ts": s.last_updated.isoformat(),
-                        "ts_epoch": s.last_updated.timestamp(),
-                        "source_value": (
-                            str(s.state) if s.state is not None else None
-                        ),
-                        "dest_has_row_at_same_ts": False,
-                        "prev_dest_good_ts": None,
-                        "next_dest_good_ts": None,
-                        "gap_minutes": None,
-                        "decision": "imported_no_destination_history",
-                        "reason": "Destination had no prior history; full import.",
-                    }
-                )
+                src_val = str(s.state) if s.state is not None else None
+                rec = {
+                    "ts": s.last_updated.isoformat(),
+                    "ts_epoch": s.last_updated.timestamp(),
+                    "source_value": src_val,
+                    "dest_has_row_at_same_ts": False,
+                    "prev_dest_good_ts": None,
+                    "next_dest_good_ts": None,
+                    "gap_minutes": None,
+                    "decision": "imported_no_destination_history",
+                    "reason": "Destination had no prior history; full import.",
+                }
+                if scale_factor is not None:
+                    rec["scaled_value"] = _scale_state_value(
+                        src_val, scale_factor
+                    )
+                debug_records.append(rec)
             _LOGGER.info(
                 "Destination %s has no history — %s %d source states",
                 dest_entity_id,
@@ -755,6 +823,10 @@ def _insert_states_atomic(
                     "source_value": src_val,
                     "dest_has_row_at_same_ts": ts in dest_ts_set,
                 }
+                if scale_factor is not None:
+                    rec["scaled_value"] = _scale_state_value(
+                        src_val, scale_factor
+                    )
 
                 if good_dest_ts_list:
                     i_left = bisect.bisect_left(good_dest_ts_list, ts)
@@ -959,8 +1031,15 @@ def _insert_states_atomic(
                 last_reported_ts = last_reported.timestamp()
 
             # -- Build the States row --
+            if state.state is None:
+                state_val = None
+            else:
+                state_val = str(state.state)
+                if scale_factor is not None:
+                    state_val = _scale_state_value(state_val, scale_factor)
+                state_val = state_val[:255]
             db_state = States(
-                state=str(state.state)[:255] if state.state is not None else None,
+                state=state_val,
                 metadata_id=metadata_id,
                 attributes_id=attributes_id,
                 last_changed_ts=last_changed_ts,
@@ -1214,6 +1293,7 @@ async def _async_import_statistics_for_pair(
     dest_id: str,
     *,
     dry_run: bool = False,
+    scale_factor: float | None = None,
 ) -> dict[str, Any]:
     """Import long-term statistics from source to destination — gap-fill mode.
 
@@ -1286,6 +1366,11 @@ async def _async_import_statistics_for_pair(
     out["stats_source_total"] = len(source_rows)
     if not source_rows:
         return out
+
+    # -- Apply the unit scaling factor BEFORE any splice math --
+    # The sum offset and column merges below must operate in the destination's
+    # value space, so the source rows are converted first.
+    source_rows = _scale_stat_rows(source_rows, scale_factor)
 
     # -- Compute sum offset (None if not applicable) --
     sum_offset = _compute_sum_offset(source_rows, dest_rows)
@@ -1387,7 +1472,11 @@ async def _async_import_statistics_for_pair(
         unit = metadata.get("unit_of_measurement")
     else:
         # Destination has no metadata yet — construct from the live sensor.
-        state_obj = hass.states.get(dest_id) or hass.states.get(source_id)
+        # With a scaling factor the source's unit no longer matches the scaled
+        # values, so only the destination's unit is trusted.
+        state_obj = hass.states.get(dest_id) or (
+            None if scale_factor is not None else hass.states.get(source_id)
+        )
         if state_obj:
             unit = state_obj.attributes.get("unit_of_measurement")
 
@@ -1566,6 +1655,7 @@ async def _async_import_short_term_statistics_for_pair(
     *,
     gap_threshold_minutes: int,
     dry_run: bool = False,
+    scale_factor: float | None = None,
 ) -> dict[str, Any]:
     """Backfill short-term (5-minute) statistics from source to destination.
 
@@ -1624,6 +1714,9 @@ async def _async_import_short_term_statistics_for_pair(
     out["stats_short_source_total"] = len(source_rows)
     if not source_rows:
         return out
+
+    # -- Apply the unit scaling factor BEFORE any splice math (see LTS path) --
+    source_rows = _scale_stat_rows(source_rows, scale_factor)
 
     # -- Reuse LTS splice-offset logic (works identically on 5-min rows) --
     sum_offset = _compute_sum_offset(source_rows, dest_rows)
@@ -1718,7 +1811,11 @@ async def _async_import_short_term_statistics_for_pair(
         metadata["statistic_id"] = dest_id
         metadata["source"] = "recorder"
     else:
-        state_obj = hass.states.get(dest_id) or hass.states.get(source_id)
+        # With a scaling factor the source's unit no longer matches the scaled
+        # values, so only the destination's unit is trusted (see LTS path).
+        state_obj = hass.states.get(dest_id) or (
+            None if scale_factor is not None else hass.states.get(source_id)
+        )
         unit = state_obj.attributes.get("unit_of_measurement") if state_obj else None
         meta_kwargs: dict[str, Any] = {
             "has_sum": has_sum,

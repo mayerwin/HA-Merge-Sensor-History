@@ -61,9 +61,10 @@ HA does **not** regenerate statistics from states retroactively. Both are import
 3. Select a **destination** entity (the new sensor you want the history imported into)
 4. Use **+ Add Pair** to queue multiple imports at once, or **Bulk add pairs** to paste a whole list of `source, destination` lines in one go
 5. Use the **filter** field to narrow down entities by keyword (e.g., `ecowitt`, `temperature`). Uncheck **Same filter for both** to filter the source and destination lists separately — handy when only a serial number differs between the old and new sensors (filter source on the old serial, destination on the new one)
-6. Click **Preview** to see exactly what would be imported (including the per-row debug JSON) without writing anything to the database
-7. Click **Import History**
-8. Review the results — each pair shows how many states and statistics were imported
+6. If the sensors record the same quantity in **different units**, enable **Apply a scaling factor to imported values** under Options and set the multiplier (e.g. `1000` for kWh → Wh, `0.001` for Wh → kWh). Every numeric source value (states and statistics) is converted before import, and energy totals are spliced after conversion
+7. Click **Preview** to see exactly what would be imported (including the per-row debug JSON) without writing anything to the database
+8. Click **Import History**
+9. Review the results — each pair shows how many states and statistics were imported
 
 > **Energy & cost are separate sensors.** In the Energy dashboard, a sensor's consumption and its *cost* are tracked by two different entities. If you migrate only the energy sensor, the new sensor's past **cost will show `0`**. To bring the cost history across too, add a **second pair** for the cost sensors (old cost → new cost). The same applies to any other derived sensor (e.g. compensated/return energy).
 

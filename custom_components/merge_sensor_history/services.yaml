@@ -16,3 +16,30 @@ import_history:
       example: "sensor.new_temperature"
       selector:
         entity:
+    fill_gaps:
+      name: Fill Gaps
+      description: "Also fill gaps inside the destination's existing time range (and after its newest entry) with source data."
+      required: false
+      default: false
+      selector:
+        boolean:
+    gap_threshold_minutes:
+      name: Gap Threshold
+      description: "Minimum gap width, in minutes, for a quiet period in the destination to qualify for gap-filling."
+      required: false
+      default: 60
+      selector:
+        number:
+          min: 1
+          max: 1440
+          unit_of_measurement: minutes
+    scale_factor:
+      name: Scaling Factor
+      description: "Multiply every numeric source value (states and statistics) by this factor before importing. Use when the sensors record the same quantity in different units, e.g. 1000 for kWh to Wh, or 0.001 for Wh to kWh. Omit for no scaling."
+      required: false
+      example: 1000
+      selector:
+        number:
+          min: 0
+          step: any
+          mode: box
