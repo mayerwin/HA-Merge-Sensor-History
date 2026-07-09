@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import bisect
 import hashlib
 import json
 import logging
+import math
 import os
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import Any
@@ -66,38 +69,224 @@ _EPOCH = datetime(2000, 1, 1, tzinfo=timezone.utc)
 _NON_GOOD_STATES = frozenset({"unavailable", "unknown"})
 
 
-def _scale_state_value(value: str | None, factor: float) -> str | None:
-    """Multiply a numeric state string by `factor`; pass others through.
+# --- Safe value-adjustment expressions ------------------------------------
+# A custom function is a plain math formula of `v` (the source value), e.g.
+# "v / 1000 + 3" or "v * 9/5 + 32". It is NEVER executed as code: the string
+# is parsed with ast.parse and only a strict whitelist of node types survives
+# (numbers, v/pi/e, arithmetic operators, calls to the functions below). The
+# validated AST is then interpreted directly — no eval/exec, no attribute
+# access, no subscripting, no strings — and every operand is coerced to float
+# so pathological inputs like 9**9**9**9 overflow immediately instead of
+# allocating unbounded big-ints.
+
+_VALUE_FUNCTION_MAX_LEN = 200
+
+# name -> (callable, min_args, max_args)
+_MATH_FUNCS: dict[str, tuple[Callable[..., float], int, int]] = {
+    "abs": (lambda x: abs(x), 1, 1),
+    "round": (lambda x: float(round(x)), 1, 1),
+    "floor": (lambda x: float(math.floor(x)), 1, 1),
+    "ceil": (lambda x: float(math.ceil(x)), 1, 1),
+    "sqrt": (math.sqrt, 1, 1),
+    "log": (math.log, 1, 2),  # log(x) natural, log(x, base)
+    "log10": (math.log10, 1, 1),
+    "log2": (math.log2, 1, 1),
+    "exp": (math.exp, 1, 1),
+    "min": (lambda *xs: float(min(xs)), 2, 8),
+    "max": (lambda *xs: float(max(xs)), 2, 8),
+    "pow": (lambda a, b: float(a) ** float(b), 2, 2),
+}
+_MATH_CONSTS = {"pi": math.pi, "e": math.e}
+
+
+def _compile_value_function(expr: str) -> Callable[[float], float]:
+    """Compile a restricted math expression into a float -> float callable.
+
+    Raises ValueError with a user-readable message on anything outside the
+    whitelisted grammar. `^` is accepted as power and a `Math.` prefix is
+    tolerated so JavaScript-style formulas work.
+    """
+    normalized = str(expr).strip().lower().replace("math.", "").replace("^", "**")
+    if not normalized:
+        raise ValueError("The formula is empty.")
+    if len(normalized) > _VALUE_FUNCTION_MAX_LEN:
+        raise ValueError(
+            f"The formula is too long (max {_VALUE_FUNCTION_MAX_LEN} characters)."
+        )
+    try:
+        tree = ast.parse(normalized, mode="eval")
+    except (SyntaxError, ValueError, RecursionError, MemoryError) as exc:
+        raise ValueError(f"Not a valid math formula: {exc}") from exc
+
+    uses_v = False
+
+    def build(node: ast.AST) -> Callable[[float], float]:
+        nonlocal uses_v
+        if isinstance(node, ast.Expression):
+            return build(node.body)
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, bool) or not isinstance(
+                node.value, (int, float)
+            ):
+                raise ValueError("Only plain numbers are allowed as constants.")
+            const_val = float(node.value)
+            return lambda v: const_val
+        if isinstance(node, ast.Name):
+            if node.id == "v":
+                uses_v = True
+                return lambda v: v
+            if node.id in _MATH_CONSTS:
+                named_const = _MATH_CONSTS[node.id]
+                return lambda v: named_const
+            raise ValueError(
+                f"Unknown name '{node.id}' — only v, pi and e are allowed."
+            )
+        if isinstance(node, ast.UnaryOp) and isinstance(
+            node.op, (ast.UAdd, ast.USub)
+        ):
+            operand = build(node.operand)
+            if isinstance(node.op, ast.USub):
+                return lambda v: -operand(v)
+            return operand
+        if isinstance(node, ast.BinOp) and isinstance(
+            node.op,
+            (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow, ast.FloorDiv),
+        ):
+            left, right = build(node.left), build(node.right)
+            op = type(node.op)
+            if op is ast.Add:
+                return lambda v: left(v) + right(v)
+            if op is ast.Sub:
+                return lambda v: left(v) - right(v)
+            if op is ast.Mult:
+                return lambda v: left(v) * right(v)
+            if op is ast.Div:
+                return lambda v: left(v) / right(v)
+            if op is ast.FloorDiv:
+                return lambda v: float(left(v) // right(v))
+            if op is ast.Mod:
+                # math.fmod matches the sign behavior of the % operator in
+                # JavaScript/C, which is what formula authors expect.
+                return lambda v: math.fmod(left(v), right(v))
+            return lambda v: float(left(v)) ** float(right(v))  # ast.Pow
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in _MATH_FUNCS:
+                raise ValueError(
+                    "Only these functions are allowed: "
+                    + ", ".join(sorted(_MATH_FUNCS))
+                )
+            if node.keywords:
+                raise ValueError("Keyword arguments are not allowed.")
+            func, min_args, max_args = _MATH_FUNCS[node.func.id]
+            if not (min_args <= len(node.args) <= max_args):
+                raise ValueError(
+                    f"{node.func.id}() takes {min_args}"
+                    + (f" to {max_args}" if max_args != min_args else "")
+                    + " argument(s)."
+                )
+            arg_fns = [build(a) for a in node.args]
+            return lambda v: float(func(*(a(v) for a in arg_fns)))
+        raise ValueError(
+            f"'{type(node).__name__}' is not allowed — only plain math "
+            "formulas are supported."
+        )
+
+    fn = build(tree)
+    if not uses_v:
+        raise ValueError("The formula must use the variable v (the source value).")
+    return fn
+
+
+def _build_transform(
+    scale_factor: float | None, value_function: str | None
+) -> Callable[[float], float] | None:
+    """Build the value transform from the user's options (or None for off).
+
+    Raises ValueError on an invalid combination or formula.
+    """
+    if value_function is not None and not str(value_function).strip():
+        value_function = None
+    if scale_factor is not None and value_function is not None:
+        raise ValueError(
+            "Provide either a scaling factor or a custom function, not both."
+        )
+    if value_function is not None:
+        return _compile_value_function(value_function)
+    if scale_factor is not None and scale_factor != 1.0:
+        factor = float(scale_factor)
+        return lambda v: v * factor
+    return None
+
+
+def _scale_state_value(
+    value: str | None, transform: Callable[[float], float]
+) -> str | None:
+    """Apply the value transform to a numeric state string; pass others through.
 
     Non-numeric states (text sensors, unavailable/unknown) are returned
-    unchanged. %.10g keeps enough precision for energy counters while
-    avoiding float-repr noise like 0.30000000000000004.
+    unchanged. A transform error or non-finite result raises ValueError so the
+    import fails loudly instead of writing corrupted history. %.10g keeps
+    enough precision for energy counters while avoiding float-repr noise like
+    0.30000000000000004.
     """
     if value is None or value in _NON_GOOD_STATES:
         return value
     try:
-        return f"{float(value) * factor:.10g}"
+        numeric = float(value)
     except (ValueError, TypeError):
         return value
+    try:
+        result = float(transform(numeric))
+    except (ValueError, ZeroDivisionError, OverflowError, TypeError) as exc:
+        raise ValueError(
+            f"Value adjustment failed for state value {value!r}: {exc}"
+        ) from exc
+    if not math.isfinite(result):
+        raise ValueError(
+            f"Value adjustment produced a non-finite result for state value "
+            f"{value!r}."
+        )
+    return f"{result:.10g}"
 
 
-def _scale_stat_rows(rows: list[dict], factor: float | None) -> list[dict]:
-    """Return copies of statistics rows with numeric columns multiplied by
-    `factor` (mean/min/max/sum/state). Timestamps and last_reset untouched.
+def _scale_stat_rows(
+    rows: list[dict], transform: Callable[[float], float] | None
+) -> list[dict]:
+    """Return copies of statistics rows with numeric columns transformed
+    (mean/min/max/sum/state). Timestamps and last_reset untouched.
 
-    Scaling happens BEFORE the sum-offset / splice computations so that the
-    offset joining the imported series to the destination is computed in the
-    destination's (scaled) value space.
+    The transform happens BEFORE the sum-offset / splice computations so that
+    the offset joining the imported series to the destination is computed in
+    the destination's (converted) value space. If the transform is decreasing,
+    min/max are re-ordered so min <= max still holds.
     """
-    if factor is None:
+    if transform is None:
         return rows
     scaled = []
     for row in rows:
         row2 = dict(row)
         for key in ("mean", "min", "max", "sum", "state"):
             value = row2.get(key)
-            if value is not None:
-                row2[key] = float(value) * factor
+            if value is None:
+                continue
+            try:
+                result = float(transform(float(value)))
+            except (ValueError, ZeroDivisionError, OverflowError, TypeError) as exc:
+                raise ValueError(
+                    f"Value adjustment failed for statistics value {value}: {exc}"
+                ) from exc
+            if not math.isfinite(result):
+                raise ValueError(
+                    f"Value adjustment produced a non-finite result for "
+                    f"statistics value {value}."
+                )
+            row2[key] = result
+        if (
+            row2.get("min") is not None
+            and row2.get("max") is not None
+            and row2["min"] > row2["max"]
+        ):
+            row2["min"], row2["max"] = row2["max"], row2["min"]
         scaled.append(row2)
     return scaled
 
@@ -181,6 +370,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         scale_factor = call.data.get("scale_factor")
         if scale_factor is not None and scale_factor == 1.0:
             scale_factor = None
+        value_function = call.data.get("value_function")
         result = await _async_import_pair(
             hass,
             source,
@@ -188,6 +378,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             fill_gaps=fill_gaps,
             gap_threshold_minutes=gap_threshold_minutes,
             scale_factor=scale_factor,
+            value_function=value_function,
         )
         if result["error"]:
             _LOGGER.error(
@@ -216,6 +407,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 ),
                 vol.Optional("scale_factor"): vol.All(
                     vol.Coerce(float), vol.Range(min=1e-12)
+                ),
+                vol.Optional("value_function"): vol.All(
+                    cv.string, vol.Length(min=1, max=_VALUE_FUNCTION_MAX_LEN)
                 ),
             }
         ),
@@ -247,6 +441,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 # ---------------------------------------------------------------------------
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "merge_sensor_history/import",
@@ -266,6 +461,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         vol.Optional("scale_factor", default=None): vol.Any(
             None, vol.All(vol.Coerce(float), vol.Range(min=1e-12))
         ),
+        vol.Optional("value_function", default=None): vol.Any(
+            None,
+            vol.All(cv.string, vol.Length(min=1, max=_VALUE_FUNCTION_MAX_LEN)),
+        ),
     }
 )
 @websocket_api.async_response
@@ -278,6 +477,7 @@ async def ws_import_history(
     gap_threshold_minutes = int(msg.get("gap_threshold_minutes", 60))
     dry_run = bool(msg.get("dry_run", False))
     scale_factor = msg.get("scale_factor")
+    value_function = msg.get("value_function")
     # A factor of exactly 1 is a no-op — treat it as disabled.
     if scale_factor is not None and scale_factor == 1.0:
         scale_factor = None
@@ -292,6 +492,7 @@ async def ws_import_history(
             gap_threshold_minutes=gap_threshold_minutes,
             dry_run=dry_run,
             scale_factor=scale_factor,
+            value_function=value_function,
         )
         results.append(
             {
@@ -330,6 +531,7 @@ async def _async_import_pair(
     gap_threshold_minutes: int = 60,
     dry_run: bool = False,
     scale_factor: float | None = None,
+    value_function: str | None = None,
 ) -> dict[str, Any]:
     """Import all history from source entity into destination entity.
 
@@ -359,14 +561,18 @@ async def _async_import_pair(
     from the source (state strings and statistics mean/min/max/sum/state) is
     multiplied by it before being considered for import — for merging sensors
     that record the same quantity in different units (e.g. 1000 for kWh -> Wh,
-    0.001 for Wh -> kWh). Scaling happens before the cumulative-sum splice
-    offset is computed, so energy series join correctly in the destination's
-    value space.
+    0.001 for Wh -> kWh). `value_function` is the general form: a restricted
+    math formula of `v` (see _compile_value_function) for conversions a plain
+    factor can't express, e.g. "v * 9/5 + 32" for °C -> °F. The two are
+    mutually exclusive. Either way the conversion happens before the
+    cumulative-sum splice offset is computed, so energy series join correctly
+    in the destination's value space.
 
     Returns a dict with result details for the UI.
     """
     result: dict[str, Any] = {
         "scale_factor": scale_factor,  # echoed for display (None = off)
+        "value_function": value_function,  # echoed for display (None = off)
         # States
         "states_source_total": 0,
         "states_source_skipped_non_good": 0,  # unavailable/unknown source rows
@@ -410,6 +616,14 @@ async def _async_import_pair(
         result["error"] = "Source and destination cannot be the same entity."
         return result
 
+    # Build the value transform (validates the custom function's restricted
+    # math grammar — see _compile_value_function; never executed as code).
+    try:
+        transform = _build_transform(scale_factor, value_function)
+    except ValueError as exc:
+        result["error"] = str(exc)
+        return result
+
     # --- Per-destination lock to prevent concurrent imports ---
     locks: dict[str, asyncio.Lock] = hass.data[DOMAIN]["_locks"]
     if dest_id not in locks:
@@ -432,7 +646,7 @@ async def _async_import_pair(
                 fill_gaps=fill_gaps,
                 gap_threshold_minutes=gap_threshold_minutes,
                 dry_run=dry_run,
-                scale_factor=scale_factor,
+                transform=transform,
             )
         except Exception as exc:
             _LOGGER.exception(
@@ -455,7 +669,7 @@ async def _do_import(
     fill_gaps: bool = False,
     gap_threshold_minutes: int = 60,
     dry_run: bool = False,
-    scale_factor: float | None = None,
+    transform: Callable[[float], float] | None = None,
 ) -> None:
     """Execute the actual import. Separated for clean lock/error handling."""
     recorder = get_instance(hass)
@@ -519,7 +733,7 @@ async def _do_import(
             fill_gaps=fill_gaps,
             gap_threshold_minutes=gap_threshold_minutes,
             dry_run=dry_run,
-            scale_factor=scale_factor,
+            transform=transform,
         )
     )
     result["states_imported"] = imported
@@ -550,7 +764,7 @@ async def _do_import(
     # Done independently: a stats failure should not hide a successful states import.
     try:
         stats_result = await _async_import_statistics_for_pair(
-            hass, source_id, dest_id, dry_run=dry_run, scale_factor=scale_factor
+            hass, source_id, dest_id, dry_run=dry_run, transform=transform
         )
         result.update(stats_result)
     except Exception as exc:
@@ -576,7 +790,7 @@ async def _do_import(
                 dest_id,
                 gap_threshold_minutes=gap_threshold_minutes,
                 dry_run=dry_run,
-                scale_factor=scale_factor,
+                transform=transform,
             )
             result.update(short_result)
         except Exception as exc:
@@ -648,7 +862,7 @@ def _insert_states_atomic(
     fill_gaps: bool = False,
     gap_threshold_minutes: int = 60,
     dry_run: bool = False,
-    scale_factor: float | None = None,
+    transform: Callable[[float], float] | None = None,
 ) -> tuple[
     int,
     int,
@@ -755,9 +969,9 @@ def _insert_states_atomic(
                     "decision": "imported_no_destination_history",
                     "reason": "Destination had no prior history; full import.",
                 }
-                if scale_factor is not None:
+                if transform is not None:
                     rec["scaled_value"] = _scale_state_value(
-                        src_val, scale_factor
+                        src_val, transform
                     )
                 debug_records.append(rec)
             _LOGGER.info(
@@ -823,9 +1037,9 @@ def _insert_states_atomic(
                     "source_value": src_val,
                     "dest_has_row_at_same_ts": ts in dest_ts_set,
                 }
-                if scale_factor is not None:
+                if transform is not None:
                     rec["scaled_value"] = _scale_state_value(
-                        src_val, scale_factor
+                        src_val, transform
                     )
 
                 if good_dest_ts_list:
@@ -1035,8 +1249,8 @@ def _insert_states_atomic(
                 state_val = None
             else:
                 state_val = str(state.state)
-                if scale_factor is not None:
-                    state_val = _scale_state_value(state_val, scale_factor)
+                if transform is not None:
+                    state_val = _scale_state_value(state_val, transform)
                 state_val = state_val[:255]
             db_state = States(
                 state=state_val,
@@ -1293,7 +1507,7 @@ async def _async_import_statistics_for_pair(
     dest_id: str,
     *,
     dry_run: bool = False,
-    scale_factor: float | None = None,
+    transform: Callable[[float], float] | None = None,
 ) -> dict[str, Any]:
     """Import long-term statistics from source to destination — gap-fill mode.
 
@@ -1370,7 +1584,7 @@ async def _async_import_statistics_for_pair(
     # -- Apply the unit scaling factor BEFORE any splice math --
     # The sum offset and column merges below must operate in the destination's
     # value space, so the source rows are converted first.
-    source_rows = _scale_stat_rows(source_rows, scale_factor)
+    source_rows = _scale_stat_rows(source_rows, transform)
 
     # -- Compute sum offset (None if not applicable) --
     sum_offset = _compute_sum_offset(source_rows, dest_rows)
@@ -1475,7 +1689,7 @@ async def _async_import_statistics_for_pair(
         # With a scaling factor the source's unit no longer matches the scaled
         # values, so only the destination's unit is trusted.
         state_obj = hass.states.get(dest_id) or (
-            None if scale_factor is not None else hass.states.get(source_id)
+            None if transform is not None else hass.states.get(source_id)
         )
         if state_obj:
             unit = state_obj.attributes.get("unit_of_measurement")
@@ -1655,7 +1869,7 @@ async def _async_import_short_term_statistics_for_pair(
     *,
     gap_threshold_minutes: int,
     dry_run: bool = False,
-    scale_factor: float | None = None,
+    transform: Callable[[float], float] | None = None,
 ) -> dict[str, Any]:
     """Backfill short-term (5-minute) statistics from source to destination.
 
@@ -1716,7 +1930,7 @@ async def _async_import_short_term_statistics_for_pair(
         return out
 
     # -- Apply the unit scaling factor BEFORE any splice math (see LTS path) --
-    source_rows = _scale_stat_rows(source_rows, scale_factor)
+    source_rows = _scale_stat_rows(source_rows, transform)
 
     # -- Reuse LTS splice-offset logic (works identically on 5-min rows) --
     sum_offset = _compute_sum_offset(source_rows, dest_rows)
@@ -1814,7 +2028,7 @@ async def _async_import_short_term_statistics_for_pair(
         # With a scaling factor the source's unit no longer matches the scaled
         # values, so only the destination's unit is trusted (see LTS path).
         state_obj = hass.states.get(dest_id) or (
-            None if scale_factor is not None else hass.states.get(source_id)
+            None if transform is not None else hass.states.get(source_id)
         )
         unit = state_obj.attributes.get("unit_of_measurement") if state_obj else None
         meta_kwargs: dict[str, Any] = {

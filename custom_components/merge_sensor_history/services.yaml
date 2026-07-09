@@ -35,7 +35,7 @@ import_history:
           unit_of_measurement: minutes
     scale_factor:
       name: Scaling Factor
-      description: "Multiply every numeric source value (states and statistics) by this factor before importing. Use when the sensors record the same quantity in different units, e.g. 1000 for kWh to Wh, or 0.001 for Wh to kWh. Omit for no scaling."
+      description: "Multiply every numeric source value (states and statistics) by this factor before importing. Use when the sensors record the same quantity in different units, e.g. 1000 for kWh to Wh, or 0.001 for Wh to kWh. Omit for no scaling. Mutually exclusive with Value Function."
       required: false
       example: 1000
       selector:
@@ -43,3 +43,10 @@ import_history:
           min: 0
           step: any
           mode: box
+    value_function:
+      name: Value Function
+      description: "A math formula of v (the source value) applied to every numeric source value before importing, for conversions a plain factor cannot express, e.g. 'v * 9/5 + 32' for Celsius to Fahrenheit. Allowed: numbers, + - * / % ^ ( ) and abs, round, floor, ceil, sqrt, log, log10, exp, min, max, pow, pi, e. Parsed as pure math, never executed as code. Mutually exclusive with Scaling Factor."
+      required: false
+      example: "v * 9/5 + 32"
+      selector:
+        text:

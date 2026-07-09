@@ -564,6 +564,42 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           border-color: var(--primary-color, #03a9f4);
           box-shadow: 0 0 0 1px var(--primary-color, #03a9f4);
         }
+        .option-row input[type="text"] {
+          flex: 1;
+          min-width: 160px;
+          max-width: 320px;
+          padding: 6px 8px;
+          border: 1px solid var(--divider-color, #e0e0e0);
+          border-radius: 6px;
+          font-size: 13px;
+          font-family: "Roboto Mono", "Consolas", "Monaco", monospace;
+          background: var(--ha-card-background, var(--card-background-color, white));
+          color: var(--primary-text-color);
+          box-sizing: border-box;
+        }
+        .option-row input[type="text"]:focus {
+          outline: none;
+          border-color: var(--primary-color, #03a9f4);
+          box-shadow: 0 0 0 1px var(--primary-color, #03a9f4);
+        }
+        .adjust-mode-label {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          font-size: 13px;
+          color: var(--primary-text-color);
+          font-weight: 500;
+          cursor: pointer;
+          white-space: nowrap;
+        }
+        .adjust-mode-label input[type="radio"] {
+          accent-color: var(--primary-color, #03a9f4);
+          cursor: pointer;
+          margin: 0;
+        }
+        .option-hint.err {
+          color: var(--error-color, #db4437);
+        }
         .option-row .option-unit {
           color: var(--secondary-text-color);
           font-size: 13px;
@@ -662,14 +698,20 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             <span class="option-unit">minutes</span>
             <span class="option-hint">&mdash; a gap is any period this long where the destination has no state but the source does</span>
           </div>
-          <label class="option-row" style="margin-top:14px" title="Multiply every numeric value read from the source (states and statistics) by a constant before importing. Use when the two sensors record the same quantity in different units.">
+          <label class="option-row" style="margin-top:14px" title="Convert every numeric value read from the source (states and statistics) before importing. Use when the two sensors record the same quantity in different units.">
             <input type="checkbox" id="scale-cb" />
-            <span class="option-label">Apply a scaling factor to imported values</span>
+            <span class="option-label">Adjust imported values</span>
           </label>
-          <div class="option-row sub-row" id="scale-factor-row">
-            <span class="option-label">Multiply by:</span>
+          <div class="option-row sub-row" id="adjust-multiply-row">
+            <label class="adjust-mode-label"><input type="radio" name="adjust-mode" id="adjust-mode-multiply" checked /> Multiply by:</label>
             <input type="number" id="scale-factor" step="any" min="0" value="1000" />
-            <span class="option-hint">&mdash; e.g. 1000 for kWh &rarr; Wh, or 0.001 for Wh &rarr; kWh. Applied to states and statistics; energy totals are spliced after conversion. Non-numeric states are left unchanged.</span>
+            <span class="option-hint">&mdash; e.g. 1000 for kWh &rarr; Wh, or 0.001 for Wh &rarr; kWh</span>
+          </div>
+          <div class="option-row sub-row" id="adjust-custom-row">
+            <label class="adjust-mode-label"><input type="radio" name="adjust-mode" id="adjust-mode-custom" /> Custom function:</label>
+            <input type="text" id="custom-fn" placeholder="v * 9/5 + 32" spellcheck="false" autocomplete="off" />
+            <span class="option-hint" id="custom-fn-preview"></span>
+            <span class="option-hint">&mdash; a math formula of <strong>v</strong> (the source value), evaluated safely (never as JavaScript). Allowed: numbers, + - * / % ^ ( ) and abs, round, floor, ceil, sqrt, log, log10, exp, min, max, pow, pi, e. Applied to states and statistics; energy totals are spliced after conversion; non-numeric states pass through. For cumulative (energy-style) sensors keep the formula linear, like a*v + b, so hourly deltas stay correct.</span>
           </div>
         </div>
         <div class="actions">
@@ -701,7 +743,12 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     this._gapThresholdRow = shadow.getElementById("gap-threshold-row");
     this._scaleCb = shadow.getElementById("scale-cb");
     this._scaleFactor = shadow.getElementById("scale-factor");
-    this._scaleFactorRow = shadow.getElementById("scale-factor-row");
+    this._adjustMultiplyRow = shadow.getElementById("adjust-multiply-row");
+    this._adjustCustomRow = shadow.getElementById("adjust-custom-row");
+    this._adjustModeMultiply = shadow.getElementById("adjust-mode-multiply");
+    this._adjustModeCustom = shadow.getElementById("adjust-mode-custom");
+    this._customFn = shadow.getElementById("custom-fn");
+    this._customFnPreview = shadow.getElementById("custom-fn-preview");
 
     const syncGapThresholdEnabled = () => {
       this._gapThresholdRow.classList.toggle(
@@ -713,15 +760,50 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     syncGapThresholdEnabled();
     this._fillGapsCb.addEventListener("change", syncGapThresholdEnabled);
 
+    const updateFnPreview = () => {
+      const el = this._customFnPreview;
+      const active =
+        this._scaleCb.checked &&
+        this._adjustModeCustom.checked &&
+        this._customFn.value.trim();
+      if (!active) {
+        el.textContent = "";
+        el.classList.remove("err");
+        return;
+      }
+      try {
+        const fn = this._compileMathExpr(this._customFn.value);
+        const fmt = (x) => {
+          try {
+            return String(parseFloat(fn(x).toPrecision(10)));
+          } catch (e) {
+            return "error";
+          }
+        };
+        el.classList.remove("err");
+        el.textContent = `→ f(0) = ${fmt(0)}, f(1) = ${fmt(1)}, f(1000) = ${fmt(1000)}`;
+      } catch (e) {
+        el.classList.add("err");
+        el.textContent = "⚠ " + (e.message || e);
+      }
+    };
+
     const syncScaleEnabled = () => {
-      this._scaleFactorRow.classList.toggle(
-        "disabled",
-        !this._scaleCb.checked
-      );
-      this._scaleFactor.disabled = !this._scaleCb.checked;
+      const on = this._scaleCb.checked;
+      const multiply = this._adjustModeMultiply.checked;
+      this._adjustMultiplyRow.classList.toggle("disabled", !on);
+      this._adjustCustomRow.classList.toggle("disabled", !on);
+      this._adjustModeMultiply.disabled = !on;
+      this._adjustModeCustom.disabled = !on;
+      this._scaleFactor.disabled = !on || !multiply;
+      this._customFn.disabled = !on || multiply;
+      updateFnPreview();
     };
     syncScaleEnabled();
     this._scaleCb.addEventListener("change", syncScaleEnabled);
+    this._adjustModeMultiply.addEventListener("change", syncScaleEnabled);
+    this._adjustModeCustom.addEventListener("change", syncScaleEnabled);
+    this._customFn.addEventListener("input", updateFnPreview);
 
     shadow.getElementById("add-pair-btn").addEventListener("click", () => {
       this._pairs.push({ source: "", destination: "" });
@@ -967,6 +1049,176 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     this._renderPairs();
   }
 
+  /**
+   * Compile a restricted math formula of `v` into a JS function — used for
+   * the live preview and pre-submit validation.
+   *
+   * SECURITY: this is a hand-written recursive-descent parser over a
+   * whitelist grammar (numbers, v/pi/e, + - * / % ^ **, parentheses, and a
+   * fixed set of math functions). The input is NEVER passed to eval() or
+   * Function(). The backend independently re-validates and interprets the
+   * formula via Python's ast module, so the frontend check is convenience,
+   * not the security boundary.
+   */
+  _compileMathExpr(src) {
+    const FUNCS = {
+      abs: { f: Math.abs, min: 1, max: 1 },
+      round: { f: Math.round, min: 1, max: 1 },
+      floor: { f: Math.floor, min: 1, max: 1 },
+      ceil: { f: Math.ceil, min: 1, max: 1 },
+      sqrt: { f: Math.sqrt, min: 1, max: 1 },
+      log: {
+        f: (x, b) => (b === undefined ? Math.log(x) : Math.log(x) / Math.log(b)),
+        min: 1,
+        max: 2,
+      },
+      log10: { f: Math.log10, min: 1, max: 1 },
+      log2: { f: Math.log2, min: 1, max: 1 },
+      exp: { f: Math.exp, min: 1, max: 1 },
+      min: { f: Math.min, min: 2, max: 8 },
+      max: { f: Math.max, min: 2, max: 8 },
+      pow: { f: Math.pow, min: 2, max: 2 },
+    };
+    const CONSTS = { pi: Math.PI, e: Math.E };
+
+    const s = String(src).trim().toLowerCase().replace(/math\./g, "");
+    if (!s) throw new Error("The formula is empty.");
+    if (s.length > 200)
+      throw new Error("The formula is too long (max 200 characters).");
+
+    const tokens = [];
+    const re = /(\*\*|[+\-*/%^(),]|(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?|[a-z_][a-z0-9_]*)/g;
+    let idx = 0;
+    while (idx < s.length) {
+      if (/\s/.test(s[idx])) {
+        idx++;
+        continue;
+      }
+      re.lastIndex = idx;
+      const m = re.exec(s);
+      if (!m || m.index !== idx)
+        throw new Error(`Unexpected character '${s[idx]}'.`);
+      tokens.push(m[0]);
+      idx = re.lastIndex;
+    }
+
+    let pos = 0;
+    let usesV = false;
+    const peek = () => tokens[pos];
+    const expect = (tok) => {
+      if (tokens[pos] !== tok)
+        throw new Error(
+          `Expected '${tok}'` +
+            (tokens[pos] !== undefined ? ` but found '${tokens[pos]}'` : "") +
+            "."
+        );
+      pos++;
+    };
+
+    const parseExpr = () => {
+      let left = parseTerm();
+      while (peek() === "+" || peek() === "-") {
+        const op = tokens[pos++];
+        const l = left;
+        const right = parseTerm();
+        left = op === "+" ? (v) => l(v) + right(v) : (v) => l(v) - right(v);
+      }
+      return left;
+    };
+    const parseTerm = () => {
+      let left = parseUnary();
+      while (peek() === "*" || peek() === "/" || peek() === "%") {
+        const op = tokens[pos++];
+        const l = left;
+        const right = parseUnary();
+        if (op === "*") left = (v) => l(v) * right(v);
+        else if (op === "/") left = (v) => l(v) / right(v);
+        else left = (v) => l(v) % right(v);
+      }
+      return left;
+    };
+    const parseUnary = () => {
+      if (peek() === "-") {
+        pos++;
+        const operand = parseUnary();
+        return (v) => -operand(v);
+      }
+      if (peek() === "+") {
+        pos++;
+        return parseUnary();
+      }
+      return parsePower();
+    };
+    const parsePower = () => {
+      const base = parsePrimary();
+      if (peek() === "**" || peek() === "^") {
+        pos++;
+        const exp = parseUnary(); // right-associative, exponent may be signed
+        return (v) => Math.pow(base(v), exp(v));
+      }
+      return base;
+    };
+    const parsePrimary = () => {
+      const tok = peek();
+      if (tok === undefined) throw new Error("The formula ends unexpectedly.");
+      if (tok === "(") {
+        pos++;
+        const inner = parseExpr();
+        expect(")");
+        return inner;
+      }
+      if (/^(?:\d|\.\d)/.test(tok)) {
+        pos++;
+        const num = parseFloat(tok);
+        return () => num;
+      }
+      if (/^[a-z_]/.test(tok)) {
+        pos++;
+        if (peek() === "(") {
+          const spec = FUNCS[tok];
+          if (!spec)
+            throw new Error(
+              `Unknown function '${tok}'. Allowed: ${Object.keys(FUNCS).sort().join(", ")}.`
+            );
+          pos++;
+          const args = [parseExpr()];
+          while (peek() === ",") {
+            pos++;
+            args.push(parseExpr());
+          }
+          expect(")");
+          if (args.length < spec.min || args.length > spec.max)
+            throw new Error(
+              `${tok}() takes ${spec.min}` +
+                (spec.max !== spec.min ? ` to ${spec.max}` : "") +
+                " argument(s)."
+            );
+          return (v) => spec.f(...args.map((a) => a(v)));
+        }
+        if (tok === "v") {
+          usesV = true;
+          return (v) => v;
+        }
+        if (tok in CONSTS) {
+          const c = CONSTS[tok];
+          return () => c;
+        }
+        throw new Error(`Unknown name '${tok}' — only v, pi and e are allowed.`);
+      }
+      throw new Error(`Unexpected '${tok}'.`);
+    };
+
+    const fn = parseExpr();
+    if (pos !== tokens.length) throw new Error(`Unexpected '${tokens[pos]}'.`);
+    if (!usesV)
+      throw new Error("The formula must use the variable v (the source value).");
+    return (v) => {
+      const r = fn(v);
+      if (!Number.isFinite(r)) throw new Error("non-finite result");
+      return r;
+    };
+  }
+
   async _doImport(dryRun = false) {
     const validPairs = this._pairs.filter((p) => p.source && p.destination);
     if (validPairs.length === 0) {
@@ -997,13 +1249,24 @@ class MergeSensorsHistoryPanel extends HTMLElement {
 
     const scaleEnabled = this._scaleCb.checked;
     let scaleFactor = null;
+    let valueFunction = null;
     if (scaleEnabled) {
-      scaleFactor = parseFloat(this._scaleFactor.value);
-      if (!Number.isFinite(scaleFactor) || scaleFactor <= 0) {
-        alert(
-          "Scaling factor must be a positive number (e.g. 1000 for kWh \u2192 Wh, 0.001 for Wh \u2192 kWh)."
-        );
-        return;
+      if (this._adjustModeCustom.checked) {
+        valueFunction = this._customFn.value.trim();
+        try {
+          this._compileMathExpr(valueFunction);
+        } catch (e) {
+          alert("Custom function error: " + (e.message || e));
+          return;
+        }
+      } else {
+        scaleFactor = parseFloat(this._scaleFactor.value);
+        if (!Number.isFinite(scaleFactor) || scaleFactor <= 0) {
+          alert(
+            "Scaling factor must be a positive number (e.g. 1000 for kWh \u2192 Wh, 0.001 for Wh \u2192 kWh)."
+          );
+          return;
+        }
       }
     }
 
@@ -1022,10 +1285,12 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         ? `\n\nMid-stream & trailing gap-fill: ON (threshold ${gapThresholdMinutes} min)`
         : "";
 
-      const scaleLine =
-        scaleFactor !== null && scaleFactor !== 1
-          ? `\n\nScaling factor: \u00d7${scaleFactor} (every imported value is multiplied)`
-          : "";
+      let scaleLine = "";
+      if (valueFunction) {
+        scaleLine = `\n\nCustom function: f(v) = ${valueFunction} (applied to every imported value)`;
+      } else if (scaleFactor !== null && scaleFactor !== 1) {
+        scaleLine = `\n\nScaling factor: \u00d7${scaleFactor} (every imported value is multiplied)`;
+      }
 
       if (
         !confirm(
@@ -1058,6 +1323,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         gap_threshold_minutes: gapThresholdMinutes,
         dry_run: dryRun,
         scale_factor: scaleFactor,
+        value_function: valueFunction,
       });
 
       this._renderResults(response.results);
@@ -1203,8 +1469,14 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             ? `<button class="debug-dl-btn" data-pair="${pairKey}" data-kind="${kind}" title="Download per-row debug JSON for this section">&#x2B07; debug JSON (${count.toLocaleString()} rows)</button>`
             : "";
 
-        // --- Scaling factor notice ---
-        if (r.scale_factor !== null && r.scale_factor !== undefined) {
+        // --- Value adjustment notice ---
+        if (r.value_function) {
+          const esc = String(r.value_function)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;");
+          grid += `<span class="result-stat-range" style="grid-column:1/-1">Custom function ${r.dry_run ? "to be applied" : "applied"}: <strong>f(v) = ${esc}</strong> &mdash; every numeric source value ${r.dry_run ? "will be" : "was"} converted before import.</span>`;
+        } else if (r.scale_factor !== null && r.scale_factor !== undefined) {
           grid += `<span class="result-stat-range" style="grid-column:1/-1">Scaling factor ${r.dry_run ? "to be applied" : "applied"}: <strong>&times;${r.scale_factor}</strong> &mdash; every numeric source value ${r.dry_run ? "will be" : "was"} multiplied before import.</span>`;
         }
 
