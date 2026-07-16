@@ -575,6 +575,7 @@ async def _async_import_pair(
         "value_function": value_function,  # echoed for display (None = off)
         # States
         "states_source_total": 0,
+        "states_source_missing": False,  # True: source had no raw states (stats-only)
         "states_source_skipped_non_good": 0,  # unavailable/unknown source rows
         "states_imported": 0,
         "states_already_covered": 0,
@@ -690,68 +691,77 @@ async def _do_import(
     )
 
     source_states = source_states_dict.get(source_id, [])
-    if not source_states:
-        result["error"] = (
-            f"No history found for source entity '{source_id}'. "
-            f"It may have been purged (default: 10 days) or the entity ID is wrong."
-        )
-        return
-
+    have_states = bool(source_states)
     result["states_source_total"] = len(source_states)
-    _LOGGER.info(
-        "Read %d states from source entity %s (oldest: %s, newest: %s)",
-        len(source_states),
-        source_id,
-        source_states[0].last_updated.isoformat(),
-        source_states[-1].last_updated.isoformat(),
-    )
+    result["states_source_missing"] = not have_states
 
-    # --- 2. Insert states in a single ATOMIC transaction ---
-    # The cutoff (destination's oldest timestamp) is queried INSIDE the same
-    # transaction as the insert, so there is no TOCTOU race. The query uses
-    # MIN(last_updated_ts) which captures ALL row types (value changes AND
-    # attribute-only changes).
-    (
-        imported,
-        already_covered,
-        mid_stream_filled,
-        trailing_filled,
-        source_skipped_non_good,
-        dest_total_rows,
-        dest_good_rows,
-        gap_intervals_count,
-        _cutoff_ts,
-        imported_min_ts,
-        imported_max_ts,
-        debug_states,
-    ) = await recorder.async_add_executor_job(
-        partial(
-            _insert_states_atomic,
-            recorder,
-            dest_id,
-            source_states,
-            fill_gaps=fill_gaps,
-            gap_threshold_minutes=gap_threshold_minutes,
-            dry_run=dry_run,
-            transform=transform,
+    if not have_states:
+        # A deleted entity typically has no raw states left (purged after
+        # ~10 days) but its long-term statistics persist orphaned, keyed by the
+        # old statistic_id. So don't bail here — skip the states import and let
+        # the statistics path (which queries purely by statistic_id) run. If it
+        # turns out there are no statistics either, the "no history" error is
+        # set at the end of this function.
+        _LOGGER.info(
+            "Source %s has no raw states — attempting statistics-only import "
+            "(e.g. a deleted entity whose states were purged)",
+            source_id,
         )
-    )
-    result["states_imported"] = imported
-    result["states_already_covered"] = already_covered
-    result["states_mid_stream_filled"] = mid_stream_filled
-    result["states_trailing_filled"] = trailing_filled
-    result["states_source_skipped_non_good"] = source_skipped_non_good
-    result["states_dest_total_rows"] = dest_total_rows
-    result["states_dest_good_rows"] = dest_good_rows
-    result["states_gap_intervals_count"] = gap_intervals_count
-    result["debug_states"] = debug_states
-    if imported_min_ts is not None:
-        result["states_imported_start"] = datetime.fromtimestamp(
-            imported_min_ts, tz=timezone.utc
-        ).isoformat()
-        result["states_imported_end"] = datetime.fromtimestamp(
-            imported_max_ts, tz=timezone.utc
-        ).isoformat()
+    else:
+        _LOGGER.info(
+            "Read %d states from source entity %s (oldest: %s, newest: %s)",
+            len(source_states),
+            source_id,
+            source_states[0].last_updated.isoformat(),
+            source_states[-1].last_updated.isoformat(),
+        )
+
+        # --- 2. Insert states in a single ATOMIC transaction ---
+        # The cutoff (destination's oldest timestamp) is queried INSIDE the same
+        # transaction as the insert, so there is no TOCTOU race. The query uses
+        # MIN(last_updated_ts) which captures ALL row types (value changes AND
+        # attribute-only changes).
+        (
+            imported,
+            already_covered,
+            mid_stream_filled,
+            trailing_filled,
+            source_skipped_non_good,
+            dest_total_rows,
+            dest_good_rows,
+            gap_intervals_count,
+            _cutoff_ts,
+            imported_min_ts,
+            imported_max_ts,
+            debug_states,
+        ) = await recorder.async_add_executor_job(
+            partial(
+                _insert_states_atomic,
+                recorder,
+                dest_id,
+                source_states,
+                fill_gaps=fill_gaps,
+                gap_threshold_minutes=gap_threshold_minutes,
+                dry_run=dry_run,
+                transform=transform,
+            )
+        )
+        result["states_imported"] = imported
+        result["states_already_covered"] = already_covered
+        result["states_mid_stream_filled"] = mid_stream_filled
+        result["states_trailing_filled"] = trailing_filled
+        result["states_source_skipped_non_good"] = source_skipped_non_good
+        result["states_dest_total_rows"] = dest_total_rows
+        result["states_dest_good_rows"] = dest_good_rows
+        result["states_gap_intervals_count"] = gap_intervals_count
+        result["debug_states"] = debug_states
+        if imported_min_ts is not None:
+            result["states_imported_start"] = datetime.fromtimestamp(
+                imported_min_ts, tz=timezone.utc
+            ).isoformat()
+            result["states_imported_end"] = datetime.fromtimestamp(
+                imported_max_ts, tz=timezone.utc
+            ).isoformat()
 
     # --- 3. Import statistics (gap-fill semantics) ---
     # Only inserts for hours where the destination has no existing LTS row.
@@ -769,8 +779,7 @@ async def _do_import(
         result.update(stats_result)
     except Exception as exc:
         _LOGGER.warning(
-            "States imported successfully, but statistics import failed for "
-            "%s -> %s: %s",
+            "Statistics import failed for %s -> %s: %s",
             source_id,
             dest_id,
             exc,
@@ -852,6 +861,21 @@ async def _do_import(
                 result["stats_realign_error"] = str(exc)
                 result["stats_realigned_by"] = None
                 result["stats_sum_offset"] = original_offset
+
+    # --- 6. If the source had neither states nor statistics, it is a bad or
+    # fully-purged id. Report the familiar "no history" error (unless a stats
+    # error already explains the empty result). ---
+    if (
+        not have_states
+        and result.get("stats_source_total", 0) == 0
+        and result.get("stats_short_source_total", 0) == 0
+        and not result.get("stats_error")
+    ):
+        result["error"] = (
+            f"No history found for source entity '{source_id}'. Its states may "
+            f"have been purged (default: 10 days) and it has no long-term "
+            f"statistics, or the entity ID is wrong."
+        )
 
 
 def _insert_states_atomic(

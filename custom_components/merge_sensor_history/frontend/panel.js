@@ -12,6 +12,13 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     this._importing = false;
     this._results = null;
     this._debugByPair = new Map();
+    // Deleted entities: orphaned recorder statistics whose entity is gone from
+    // the state machine. Fetched lazily via recorder/list_statistic_ids when
+    // the "Show deleted entities" toggle is first enabled.
+    this._showDeleted = false;
+    this._deletedIds = []; // sorted list of orphaned statistic_ids
+    this._deletedNames = new Map(); // id -> stored statistics name (may be "")
+    this._deletedFetched = false;
   }
 
   set hass(hass) {
@@ -25,13 +32,23 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     this._panel = panel;
   }
 
-  /** Get friendly name for an entity, or empty string if not found. */
+  /** Get friendly name for an entity, or empty string if not found.
+   *  Falls back to the stored statistics name for deleted entities (whose
+   *  live state is gone), so the confirm dialog and results still show a name. */
   _friendlyName(entityId) {
     if (!entityId || !this._hass) return "";
     const stateObj = this._hass.states[entityId];
-    if (!stateObj) return "";
-    const name = stateObj.attributes.friendly_name;
-    return name && name !== entityId ? name : "";
+    if (stateObj) {
+      const name = stateObj.attributes.friendly_name;
+      return name && name !== entityId ? name : "";
+    }
+    const stored = this._deletedNames.get(entityId);
+    return stored && stored !== entityId ? stored : "";
+  }
+
+  /** True if the id is a known deleted entity (orphaned statistics only). */
+  _isDeleted(entityId) {
+    return this._deletedNames.has(entityId);
   }
 
   _render() {
@@ -400,6 +417,37 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           font-size: 14px;
         }
 
+        .deleted-toggle {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          font-size: 13px;
+          color: var(--primary-text-color);
+          cursor: pointer;
+          user-select: none;
+          margin-bottom: 12px;
+        }
+        .deleted-toggle input[type="checkbox"] {
+          width: 15px;
+          height: 15px;
+          accent-color: var(--primary-color, #03a9f4);
+          cursor: pointer;
+          margin: 0;
+          flex-shrink: 0;
+        }
+        .deleted-toggle .deleted-note {
+          color: var(--secondary-text-color);
+          font-size: 12px;
+        }
+        .deleted-toggle .deleted-status {
+          color: var(--secondary-text-color);
+          font-size: 12px;
+          font-style: italic;
+        }
+        .deleted-toggle .deleted-status.err {
+          color: var(--error-color, #db4437);
+          font-style: normal;
+        }
         .bulk-section {
           margin-bottom: 16px;
         }
@@ -647,6 +695,11 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             Imported states will appear in history graphs after the next recorder refresh.
           </span>
         </div>
+        <label class="deleted-toggle" id="deleted-toggle" title="Deleted entities are gone from Home Assistant but their long-term (hourly) statistics can still be in the recorder. Turn this on to select them as a source. Only statistics will be merged (raw state history and 5-minute data are purged after about 10 days).">
+          <input type="checkbox" id="show-deleted-cb" />
+          <span>Show deleted entities <span class="deleted-note">(statistics only)</span></span>
+          <span class="deleted-status" id="deleted-status"></span>
+        </label>
         <div class="bulk-section">
           <button class="bulk-toggle" id="bulk-toggle">
             <span class="chevron" id="bulk-chevron">&#9654;</span>
@@ -749,6 +802,12 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     this._adjustModeCustom = shadow.getElementById("adjust-mode-custom");
     this._customFn = shadow.getElementById("custom-fn");
     this._customFnPreview = shadow.getElementById("custom-fn-preview");
+    this._showDeletedCb = shadow.getElementById("show-deleted-cb");
+    this._deletedStatus = shadow.getElementById("deleted-status");
+
+    this._showDeletedCb.addEventListener("change", () =>
+      this._onShowDeletedChange()
+    );
 
     const syncGapThresholdEnabled = () => {
       this._gapThresholdRow.classList.toggle(
@@ -858,6 +917,17 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     this._renderPairs();
   }
 
+  /** All selectable ids: live entities, plus deleted (orphaned-stats) ids when
+   *  the toggle is on. */
+  _allEntityIds() {
+    if (!this._hass) return [];
+    const live = Object.keys(this._hass.states);
+    if (this._showDeleted && this._deletedIds.length) {
+      return [...live, ...this._deletedIds].sort();
+    }
+    return live.sort();
+  }
+
   _getFilteredEntities(role) {
     if (!this._hass) return [];
     const shared = !this._sharedFilterCb || this._sharedFilterCb.checked;
@@ -867,7 +937,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         ? this._destFilterInput
         : this._sourceFilterInput;
     const filter = (input?.value || "").toLowerCase();
-    const entities = Object.keys(this._hass.states).sort();
+    const entities = this._allEntityIds();
     if (!filter) return entities;
     return entities.filter((e) => {
       if (e.toLowerCase().includes(filter)) return true;
@@ -876,20 +946,84 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     });
   }
 
+  /** Fetch orphaned recorder statistic_ids (deleted entities) once, then
+   *  re-render. Returns via status text on the toggle. */
+  async _onShowDeletedChange() {
+    this._showDeleted = this._showDeletedCb.checked;
+    if (!this._showDeleted) {
+      this._deletedStatus.textContent = "";
+      this._deletedStatus.classList.remove("err");
+      this._renderPairs();
+      return;
+    }
+    if (this._deletedFetched) {
+      this._setDeletedStatus();
+      this._renderPairs();
+      return;
+    }
+    this._deletedStatus.classList.remove("err");
+    this._deletedStatus.textContent = "loading…";
+    try {
+      const rows = await this._hass.callWS({
+        type: "recorder/list_statistic_ids",
+      });
+      const live = this._hass.states;
+      const isLive = (id) => Object.prototype.hasOwnProperty.call(live, id);
+      this._deletedIds = [];
+      this._deletedNames = new Map();
+      for (const r of rows || []) {
+        const id = r.statistic_id;
+        // Only recorder-sourced sensor stats can be merged as an entity (an
+        // entity-form id we can write to); external stats (colon ids) can't.
+        // "Deleted" = has stats but no live entity.
+        if (r.source === "recorder" && id && !isLive(id)) {
+          this._deletedIds.push(id);
+          this._deletedNames.set(id, r.name || "");
+        }
+      }
+      this._deletedIds.sort();
+      this._deletedFetched = true;
+      this._setDeletedStatus();
+    } catch (err) {
+      this._deletedStatus.classList.add("err");
+      this._deletedStatus.textContent =
+        "could not load: " + (err.message || err);
+      this._showDeleted = false;
+      this._showDeletedCb.checked = false;
+    }
+    this._renderPairs();
+  }
+
+  _setDeletedStatus() {
+    const n = this._deletedIds.length;
+    this._deletedStatus.classList.remove("err");
+    this._deletedStatus.textContent =
+      n === 0
+        ? "none found"
+        : `${n} found (shown as “deleted” below)`;
+  }
+
+  /** Build a dropdown option label, tagging deleted (orphaned-stats) ids. */
+  _optionLabel(e) {
+    const name = this._friendlyName(e);
+    if (this._isDeleted(e)) {
+      return name
+        ? `${e} (${name}) [deleted, statistics only]`
+        : `${e} [deleted, statistics only]`;
+    }
+    return name ? `${e} (${name})` : e;
+  }
+
   _buildOptions(entities, selected) {
     let opts = '<option value="">-- Select entity --</option>';
     const seen = new Set();
     if (selected && !entities.includes(selected)) {
-      const name = this._friendlyName(selected);
-      const label = name ? `${selected} (${name}) [filtered]` : `${selected} [filtered]`;
-      opts += `<option value="${selected}" selected>${label}</option>`;
+      opts += `<option value="${selected}" selected>${this._optionLabel(selected)} [filtered]</option>`;
       seen.add(selected);
     }
     for (const e of entities) {
       if (seen.has(e)) continue;
-      const name = this._friendlyName(e);
-      const label = name ? `${e} (${name})` : e;
-      opts += `<option value="${e}" ${e === selected ? "selected" : ""}>${label}</option>`;
+      opts += `<option value="${e}" ${e === selected ? "selected" : ""}>${this._optionLabel(e)}</option>`;
     }
     return opts;
   }
@@ -992,7 +1126,9 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       return;
     }
 
-    const knownEntities = this._hass ? new Set(Object.keys(this._hass.states)) : new Set();
+    // Valid ids = live entities, plus deleted (orphaned-stats) ids when the
+    // "Show deleted entities" toggle is on.
+    const knownEntities = new Set(this._allEntityIds());
     const parsed = [];
     const parseErrors = [];
     const invalidIds = new Set();
@@ -1468,6 +1604,11 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           count > 0
             ? `<button class="debug-dl-btn" data-pair="${pairKey}" data-kind="${kind}" title="Download per-row debug JSON for this section">&#x2B07; debug JSON (${count.toLocaleString()} rows)</button>`
             : "";
+
+        // --- Deleted / statistics-only source notice ---
+        if (r.states_source_missing) {
+          grid += `<span class="result-stat-range" style="grid-column:1/-1">Source has no raw state history (a deleted entity, or states purged). Only statistics ${r.dry_run ? "would be" : "were"} merged; the History panel stays empty while the Energy dashboard and long-term graphs are filled.</span>`;
+        }
 
         // --- Value adjustment notice ---
         if (r.value_function) {
