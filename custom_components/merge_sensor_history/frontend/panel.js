@@ -54,6 +54,16 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     return this._deletedNames.has(entityId);
   }
 
+  /** Escape text for safe interpolation into innerHTML. Friendly names are
+   *  arbitrary text; without this a name containing < > & renders wrong. */
+  _esc(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
   _render() {
     const shadow = this.attachShadow({ mode: "open" });
     shadow.innerHTML = `
@@ -687,7 +697,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         </div>
         <p class="subtitle">
           Import historical data from source sensors into destination sensors.<br/>
-          Only data older than the destination's oldest record will be imported &mdash; no duplicates.<br/>
+          Only data older than the destination's oldest good record will be imported &mdash; no duplicates.<br/>
           <strong>Tip:</strong> energy and its cost are tracked by <em>separate</em> sensors &mdash; add a pair for each, or past cost stays at 0.
         </p>
         <div class="warning-banner">
@@ -698,7 +708,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             Imported states will appear in history graphs after the next recorder refresh.
           </span>
         </div>
-        <label class="deleted-toggle" id="deleted-toggle" title="Lists entities that have no live state but still have long-term (hourly) statistics in the recorder, so they can be selected as a source. Tagged [deleted]: gone from Home Assistant; only statistics remain (raw states are purged per your recorder retention, default about 10 days). Tagged [disabled]: still registered; recent raw states may also be merged while they remain within the recorder retention window.">
+        <label class="deleted-toggle" id="deleted-toggle" title="Lists entities that have no live state but may still have data in the recorder, so they can be selected as a source. Tagged [deleted]: gone from Home Assistant; only long-term (hourly) statistics remain (raw states are purged per your recorder retention, about 10 days by default). Tagged [disabled] or [not loaded]: still registered; recent raw states and statistics are merged while they remain within the recorder retention window.">
           <input type="checkbox" id="show-deleted-cb" />
           <span>Show deleted/disabled entities <span class="deleted-note">(no live state)</span></span>
           <span class="deleted-status" id="deleted-status"></span>
@@ -744,7 +754,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         </div>
         <div class="options-section">
           <div class="options-title">Options</div>
-          <label class="option-row" title="By default, only data older than the destination's oldest existing entry is imported, to avoid duplicates. Enable this to also fill quiet periods inside the destination's existing time range.">
+          <label class="option-row" title="By default, only data older than the destination's oldest good entry is imported, to avoid duplicates (hidden unavailable/unknown rows do not count). Enable this to also fill quiet periods inside the destination's existing time range.">
             <input type="checkbox" id="fill-gaps-cb" />
             <span class="option-label">Fill mid-stream gaps in the destination's existing time range</span>
           </label>
@@ -1003,6 +1013,19 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           );
         }
       }
+      // Registered entities with no live state (disabled, or not loaded) are
+      // selectable even without statistics: their raw states may still be in
+      // the recorder and can be merged.
+      for (const [id, reg] of registry) {
+        if (!isLive(id) && !this._deletedNames.has(id)) {
+          this._deletedIds.push(id);
+          this._deletedNames.set(id, reg.name || reg.original_name || "");
+          this._deletedKinds.set(
+            id,
+            reg.disabled_by ? "disabled" : "not loaded"
+          );
+        }
+      }
       this._deletedIds.sort();
       this._deletedFetched = true;
       this._setDeletedStatus();
@@ -1027,7 +1050,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
    *  entity keeps only its statistics; a disabled one may still have recent
    *  raw states in the recorder, so its tag must not say "statistics only". */
   _optionLabel(e) {
-    const name = this._friendlyName(e);
+    const name = this._esc(this._friendlyName(e));
     if (this._isDeleted(e)) {
       const kind = this._deletedKinds.get(e) || "deleted";
       const tag =
@@ -1150,7 +1173,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     }
 
     // Valid ids = live entities, plus deleted (orphaned-stats) ids when the
-    // "Show deleted entities" toggle is on.
+    // "Show deleted/disabled entities" toggle is on.
     const knownEntities = new Set(this._allEntityIds());
     const parsed = [];
     const parseErrors = [];
@@ -1579,8 +1602,8 @@ class MergeSensorsHistoryPanel extends HTMLElement {
 
     this._resultsContainer.innerHTML = results
       .map((r, i) => {
-        const srcName = this._friendlyName(r.source);
-        const dstName = this._friendlyName(r.destination);
+        const srcName = this._esc(this._friendlyName(r.source));
+        const dstName = this._esc(this._friendlyName(r.destination));
         const srcLabel = srcName ? `${r.source} (${srcName})` : r.source;
         const dstLabel = dstName ? `${r.destination} (${dstName})` : r.destination;
         const pairLabel = (r.dry_run ? "Preview: " : "") + `${srcLabel} \u2192 ${dstLabel}`;
@@ -1651,7 +1674,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           if (r.states_already_covered > 0)
             grid += `<span class="result-stat-value">${r.states_already_covered.toLocaleString()}</span><span class="result-stat-label">already present in destination</span>`;
           if (!r.fill_gaps && r.states_already_covered > 0)
-            grid += `<span class="result-stat-range" style="grid-column:1/-1">Skipped states fall inside the destination's existing range. If part of that range looks empty in the History panel, enable <strong>Fill gaps</strong> and run a Preview to see what could be imported.</span>`;
+            grid += `<span class="result-stat-range" style="grid-column:1/-1">Skipped states fall inside the destination's existing range. If part of that range looks empty in the History panel, enable <strong>Fill mid-stream gaps</strong> under Options and run a Preview to see what could be imported.</span>`;
           grid += `<span class="result-stat-value">${r.states_imported.toLocaleString()}</span><span class="result-stat-label">${actionVerb}</span>`;
           if (r.states_mid_stream_filled > 0)
             grid += `<span class="result-stat-value">${r.states_mid_stream_filled.toLocaleString()}</span><span class="result-stat-label">&nbsp;&nbsp;&mdash; mid-stream gap-fill</span>`;

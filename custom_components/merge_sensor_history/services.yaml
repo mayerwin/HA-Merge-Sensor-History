@@ -1,6 +1,6 @@
 import_history:
   name: Import History
-  description: "Import all historical states from a source entity into a destination entity. Only imports data older than the destination's oldest record."
+  description: "Import all historical states from a source entity into a destination entity. Only imports data older than the destination's oldest good record (hidden unavailable/unknown rows do not count), unless fill_gaps is enabled."
   fields:
     source_entity_id:
       name: Source Entity
