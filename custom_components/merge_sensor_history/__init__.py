@@ -499,6 +499,7 @@ async def ws_import_history(
                 "source": pair["source"],
                 "destination": pair["destination"],
                 "dry_run": dry_run,
+                "fill_gaps": fill_gaps,
                 **result,
             }
         )
@@ -537,7 +538,8 @@ async def _async_import_pair(
 
     This function is IDEMPOTENT:
     - It only imports source states strictly older than the destination's
-      oldest entry (unless `fill_gaps` is set, which also fills mid-stream
+      oldest GOOD entry — hidden unavailable/unknown rows don't count as
+      coverage — (unless `fill_gaps` is set, which also fills mid-stream
       and trailing gaps in the destination's state history).
     - The state insertion is ATOMIC (single transaction): either all states
       are committed, or none are (full rollback).
@@ -908,7 +910,11 @@ def _insert_states_atomic(
 
     Import rules:
     - **Head fill (always):** any source state strictly older than the
-      destination's oldest existing entry is imported.
+      destination's oldest GOOD entry is imported. Hidden rows (unavailable/
+      unknown) do not count as coverage — a destination whose earliest rows
+      are just unavailable markers has no visible history there, so source
+      states in that region are still head-filled (minus exact-timestamp
+      duplicates).
     - **Mid-stream fill (when `fill_gaps` is True):** for each pair of adjacent
       destination state timestamps whose delta is >= `gap_threshold_minutes`,
       import all source states strictly between them.
@@ -918,7 +924,9 @@ def _insert_states_atomic(
 
     Deduplication: source states whose `last_updated` timestamp exactly matches
     an existing destination timestamp are skipped (prevents introducing
-    same-timestamp twins).
+    same-timestamp twins). This always applies in the head region (where the
+    destination can only hold hidden rows) and, with `fill_gaps`, across the
+    destination's whole range.
 
     Idempotency: head-fill moves the cutoff earlier on re-run; gap-fill modes
     close the gaps they fill, so a re-run sees the same (or no remaining) gaps.
@@ -962,23 +970,43 @@ def _insert_states_atomic(
         else:
             metadata_id = meta.metadata_id
 
-        # -- Query the TRUE oldest timestamp for the destination entity --
+        # -- Query the destination's oldest GOOD timestamp --
         # This runs in the same transaction as the inserts: no TOCTOU race.
-        # Uses MIN(last_updated_ts) which captures ALL row types.
+        # Non-good rows (unavailable/unknown) are excluded from the cutoff:
+        # HA hides them in the History panel, so a destination whose earliest
+        # rows are just unavailable markers (e.g. a ghost/restored entity that
+        # logged a row at every restart) has no VISIBLE history there — source
+        # states in that region must still be head-fillable. Destination rows
+        # sitting before the cutoff (all non-good by construction) are loaded
+        # for same-timestamp dedup instead, which also keeps head fill
+        # idempotent when the imported head states are themselves non-good.
+        head_dedup_ts: set[float] = set()
         if metadata_id == -1:
             min_ts = None
         else:
             min_ts = (
                 session.query(sql_func.min(States.last_updated_ts))
-                .filter(States.metadata_id == metadata_id)
+                .filter(
+                    States.metadata_id == metadata_id,
+                    States.state.isnot(None),
+                    States.state.notin_(list(_NON_GOOD_STATES)),
+                )
                 .scalar()
             )
+            head_dedup_q = session.query(States.last_updated_ts).filter(
+                States.metadata_id == metadata_id
+            )
+            if min_ts is not None:
+                head_dedup_q = head_dedup_q.filter(
+                    States.last_updated_ts < min_ts
+                )
+            head_dedup_ts = {row[0] for row in head_dedup_q.all()}
 
         # -- Decide which source states to import --
         # Single classification pass: each source state is either head /
         # mid_stream / trailing / various skip reasons. The same pass produces
         # the per-row debug_records list returned to the UI.
-        if min_ts is None:
+        if min_ts is None and not head_dedup_ts:
             to_import = list(source_states)
             for s in source_states:
                 src_val = str(s.state) if s.state is not None else None
@@ -1005,7 +1033,13 @@ def _insert_states_atomic(
                 len(source_states),
             )
         else:
-            cutoff_dt = datetime.fromtimestamp(min_ts, tz=timezone.utc)
+            # None here means the destination has rows but none of them are
+            # good — every source state is head-fillable (minus exact-ts twins).
+            cutoff_dt = (
+                datetime.fromtimestamp(min_ts, tz=timezone.utc)
+                if min_ts is not None
+                else None
+            )
 
             head: list = []
             mid_stream: list = []
@@ -1059,7 +1093,8 @@ def _insert_states_atomic(
                     "ts": s.last_updated.isoformat(),
                     "ts_epoch": ts,
                     "source_value": src_val,
-                    "dest_has_row_at_same_ts": ts in dest_ts_set,
+                    "dest_has_row_at_same_ts": ts in dest_ts_set
+                    or ts in head_dedup_ts,
                 }
                 if transform is not None:
                     rec["scaled_value"] = _scale_state_value(
@@ -1101,12 +1136,23 @@ def _insert_states_atomic(
                     else None
                 )
 
-                if s.last_updated < cutoff_dt:
-                    head.append(s)
-                    rec["decision"] = "head_imported"
-                    rec["reason"] = (
-                        "Older than destination's oldest entry — head fill."
-                    )
+                if cutoff_dt is None or s.last_updated < cutoff_dt:
+                    if ts in head_dedup_ts or ts in dest_ts_set:
+                        rec["decision"] = "skipped_dest_has_same_ts"
+                        rec["reason"] = (
+                            "Destination already has a row at this exact "
+                            "timestamp."
+                        )
+                    else:
+                        head.append(s)
+                        rec["decision"] = "head_imported"
+                        rec["reason"] = (
+                            "Older than destination's oldest good entry — "
+                            "head fill."
+                            if cutoff_dt is not None
+                            else "Destination has only hidden "
+                            "(unavailable/unknown) rows — head fill."
+                        )
                 elif not fill_gaps:
                     rec["decision"] = "skipped_fill_gaps_disabled"
                     rec["reason"] = (
@@ -1194,12 +1240,12 @@ def _insert_states_atomic(
             trailing_filled = len(trailing)
 
             _LOGGER.info(
-                "Destination %s oldest entry: %s — head: %d, mid-stream: %d, "
+                "Destination %s oldest good entry: %s — head: %d, mid-stream: %d, "
                 "trailing: %d, source_skipped_non_good: %d "
                 "(fill_gaps=%s, threshold=%dmin, %d source states, "
                 "dest rows: %d total / %d good, %d gap intervals, dry_run=%s)",
                 dest_entity_id,
-                cutoff_dt.isoformat(),
+                cutoff_dt.isoformat() if cutoff_dt else "none (only hidden rows)",
                 len(head),
                 mid_stream_filled,
                 trailing_filled,
