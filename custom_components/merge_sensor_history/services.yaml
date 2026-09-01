@@ -23,6 +23,13 @@ import_history:
       default: false
       selector:
         boolean:
+    overwrite:
+      name: "Overwrite existing data (destructive)"
+      description: "DESTRUCTIVE. Replace the destination's data with the source's wherever the source has data, instead of only filling holes. Destination state rows inside the source's time span are deleted and replaced, and statistics values are overwritten. Deleted rows cannot be recovered without a database backup. Use only for a destination holding known-bad values, and back up your database first."
+      required: false
+      default: false
+      selector:
+        boolean:
     gap_threshold_minutes:
       name: Gap Threshold
       description: "Minimum gap width, in minutes, for a quiet period in the destination to qualify for gap-filling."

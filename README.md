@@ -10,6 +10,7 @@ Built for migrating sensor data between integrations — for example, when repla
 - **Imports both states and long-term statistics** (hourly aggregates for energy dashboard / long-term graphs)
 - **Atomic transactions**: either all states are imported or none are — no partial imports that leave gaps
 - **Idempotent**: safe to re-run; a successful import shifts the cutoff so nothing is re-imported, and a failed import is fully rolled back
+- **Optional overwrite mode** for destinations holding known-bad data (opt-in, destructive, clearly warned)
 - **Entity filter** to quickly find sensors by keyword
 - **Also available as a service** (`merge_sensor_history.import_history`) for use in automations or Developer Tools
 - **HACS compatible**
@@ -63,9 +64,25 @@ HA does **not** regenerate statistics from states retroactively. Both are import
 5. To merge from a **deleted or disabled** entity (one with no live state but whose data is still in the recorder), enable **Show deleted/disabled entities** above Bulk add pairs. Those ids then appear in the dropdowns and Bulk add, tagged by kind. A *deleted* entity keeps only its hourly statistics (its raw states are purged per your recorder retention, about 10 days by default), so the merge fills the Energy dashboard and long-term graphs, not the History panel. A *disabled* entity may still have recent raw states in the recorder, and those are merged too. Since raw states keep aging out daily, merge from a disabled entity as soon as possible
 6. Use the **filter** field to narrow down entities by keyword (e.g., `ecowitt`, `temperature`). Uncheck **Same filter for both** to filter the source and destination lists separately — handy when only a serial number differs between the old and new sensors (filter source on the old serial, destination on the new one)
 7. If the sensors record the same quantity in **different units**, enable **Adjust imported values** under Options. **Multiply by** covers simple factors (e.g. `1000` for kWh → Wh, `0.001` for Wh → kWh); **Custom function** takes a math formula of `v` for anything else (e.g. `v * 9/5 + 32` for °C → °F), with a live preview of sample values. Formulas are parsed as pure math (numbers, `+ - * / % ^ ( )`, `abs round floor ceil sqrt log log10 exp min max pow pi e`) and are never executed as code. Every numeric source value (states and statistics) is converted before import, and energy totals are spliced after conversion; for cumulative energy sensors keep the formula linear (`a*v + b`) so hourly deltas stay correct
-8. Click **Preview** to see exactly what would be imported (including the per-row debug JSON) without writing anything to the database
-9. Click **Import History**
-10. Review the results — each pair shows how many states and statistics were imported
+8. If the destination holds data you know is **wrong**, enable **⚠️ Overwrite existing destination data** under Options. See [Overwrite mode](#overwrite-mode-destructive) below before using it
+9. Click **Preview** to see exactly what would be imported (including the per-row debug JSON) without writing anything to the database
+10. Click **Import History**
+11. Review the results — each pair shows how many states and statistics were imported
+
+### Overwrite mode (destructive)
+
+By default the import never touches data the destination already has: it fills in front of the oldest good entry, and (with gap-fill) inside empty stretches. That is the right behavior almost always, but it cannot help when the destination's existing data is itself wrong: a new sensor that logged **zeros** while it was being commissioned alongside the old one, or an earlier import made with the **wrong unit**. Gap-fill treats a stored `0` as a real value, so those hours look covered and stay wrong.
+
+**⚠️ Overwrite existing destination data** flips that rule: wherever the source has data, the source wins.
+
+- Destination **state rows inside the source's time span are deleted** and replaced by the source's states, regardless of the gap-fill setting.
+- Destination **statistics values are overwritten** (hourly and 5-minute) for every column the source provides. Columns the source does not provide keep their existing values.
+- The recent slots Home Assistant may still be compiling are still skipped, and data **outside the source's time span is never touched**.
+- For energy sensors, the splice offset is computed against the destination rows that survive, so the corrected series joins the good data instead of the values being replaced.
+
+**Deleted state rows cannot be recovered without a database backup.** Back up first, run **Preview** to see the exact row counts and the time window that would be replaced, and confirm the window matches what you intend. The panel asks for a second confirmation, listing the destination entities, before anything is deleted.
+
+Also available on the service call as `overwrite: true`.
 
 > **Energy & cost are separate sensors.** In the Energy dashboard, a sensor's consumption and its *cost* are tracked by two different entities. If you migrate only the energy sensor, the new sensor's past **cost will show `0`**. To bring the cost history across too, add a **second pair** for the cost sensors (old cost → new cost). The same applies to any other derived sensor (e.g. compensated/return energy).
 
@@ -82,7 +99,7 @@ data:
 
 ## Important notes
 
-- **Back up your database** before importing. The integration writes directly to the recorder database.
+- **Back up your database** before importing. The integration writes directly to the recorder database. This matters most with [Overwrite mode](#overwrite-mode-destructive), the one option that deletes existing rows.
 - Only data **still in the recorder** can be imported. States are purged by default after ~10 days. Long-term statistics (hourly) are kept indefinitely.
 - After importing, the new history will appear in the **History** panel. You may need to refresh the page or wait for the next recorder cycle.
 - **The source entity is never modified or deleted.** The import only writes to the destination. Once you have verified the merge (compare the graphs, check the Energy dashboard), you can remove the old entity yourself: delete it in **Settings > Devices & Services > Entities** (or disable it if you prefer to keep it around), and optionally call the `recorder.purge_entities` service to drop its leftover data from the database.

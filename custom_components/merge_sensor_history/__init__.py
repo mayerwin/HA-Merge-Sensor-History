@@ -371,6 +371,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if scale_factor is not None and scale_factor == 1.0:
             scale_factor = None
         value_function = call.data.get("value_function")
+        overwrite = bool(call.data.get("overwrite", False))
         result = await _async_import_pair(
             hass,
             source,
@@ -379,6 +380,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             gap_threshold_minutes=gap_threshold_minutes,
             scale_factor=scale_factor,
             value_function=value_function,
+            overwrite=overwrite,
         )
         if result["error"]:
             _LOGGER.error(
@@ -386,11 +388,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
         else:
             _LOGGER.info(
-                "Import from %s to %s complete: %d states, %d stats imported",
+                "Import from %s to %s complete: %d states, %d stats imported "
+                "(overwrite=%s, %d destination state rows replaced)",
                 source,
                 dest,
                 result["states_imported"],
                 result["stats_imported"],
+                overwrite,
+                result.get("states_overwritten", 0),
             )
 
     hass.services.async_register(
@@ -402,6 +407,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 vol.Required("source_entity_id"): cv.entity_id,
                 vol.Required("destination_entity_id"): cv.entity_id,
                 vol.Optional("fill_gaps", default=False): cv.boolean,
+                vol.Optional("overwrite", default=False): cv.boolean,
                 vol.Optional("gap_threshold_minutes", default=60): vol.All(
                     vol.Coerce(int), vol.Range(min=1, max=1440)
                 ),
@@ -458,6 +464,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             vol.Coerce(int), vol.Range(min=1, max=1440)
         ),
         vol.Optional("dry_run", default=False): bool,
+        vol.Optional("overwrite", default=False): bool,
         vol.Optional("scale_factor", default=None): vol.Any(
             None, vol.All(vol.Coerce(float), vol.Range(min=1e-12))
         ),
@@ -476,6 +483,7 @@ async def ws_import_history(
     fill_gaps = bool(msg.get("fill_gaps", False))
     gap_threshold_minutes = int(msg.get("gap_threshold_minutes", 60))
     dry_run = bool(msg.get("dry_run", False))
+    overwrite = bool(msg.get("overwrite", False))
     scale_factor = msg.get("scale_factor")
     value_function = msg.get("value_function")
     # A factor of exactly 1 is a no-op — treat it as disabled.
@@ -493,6 +501,7 @@ async def ws_import_history(
             dry_run=dry_run,
             scale_factor=scale_factor,
             value_function=value_function,
+            overwrite=overwrite,
         )
         results.append(
             {
@@ -533,6 +542,7 @@ async def _async_import_pair(
     dry_run: bool = False,
     scale_factor: float | None = None,
     value_function: str | None = None,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
     """Import all history from source entity into destination entity.
 
@@ -559,6 +569,17 @@ async def _async_import_pair(
     When `dry_run` is True:
     - Calculates all changes but does not write to the database.
 
+    When `overwrite` is True (DESTRUCTIVE, opt-in):
+    - Destination states inside the source's time span are deleted and
+      replaced by the source's states, regardless of `fill_gaps`.
+    - Statistics (hourly and 5-minute) take the source's values wherever the
+      source has data, instead of only filling holes. Columns the source does
+      not provide keep the destination's existing values, and the recent
+      slots HA may still be compiling are still skipped.
+    - Intended for a destination holding known-bad values (zeros logged during
+      commissioning, or an earlier import made with the wrong unit). Deleted
+      state rows are not recoverable without a database backup.
+
     When `scale_factor` is set (a positive float), every numeric value read
     from the source (state strings and statistics mean/min/max/sum/state) is
     multiplied by it before being considered for import — for merging sensors
@@ -575,8 +596,12 @@ async def _async_import_pair(
     result: dict[str, Any] = {
         "scale_factor": scale_factor,  # echoed for display (None = off)
         "value_function": value_function,  # echoed for display (None = off)
+        "overwrite": overwrite,  # echoed for display
         # States
         "states_source_total": 0,
+        "states_overwritten": 0,  # dest rows deleted and replaced (overwrite)
+        "states_overwrite_start": None,  # ISO start of the replaced window
+        "states_overwrite_end": None,  # ISO end of the replaced window
         "states_source_missing": False,  # True: source had no raw states (stats-only)
         "states_source_skipped_non_good": 0,  # unavailable/unknown source rows
         "states_imported": 0,
@@ -594,6 +619,7 @@ async def _async_import_pair(
         "stats_already_covered": 0,
         "stats_skipped_recent": 0,
         "stats_gap_filled": 0,
+        "stats_overwritten": 0,  # dest rows whose values were replaced
         "stats_imported_start": None,  # ISO datetime (hour start) of first imported stat
         "stats_imported_end": None,  # ISO datetime (hour start) of last imported stat
         "stats_sum_offset": None,  # Applied splice offset (or None) — set only when NOT realigned
@@ -604,6 +630,7 @@ async def _async_import_pair(
         "stats_short_imported": 0,
         "stats_short_already_covered": 0,
         "stats_short_skipped_recent": 0,
+        "stats_short_overwritten": 0,
         "stats_short_imported_start": None,
         "stats_short_imported_end": None,
         # Per-row debug records, for client-side download as JSON.
@@ -650,6 +677,7 @@ async def _async_import_pair(
                 gap_threshold_minutes=gap_threshold_minutes,
                 dry_run=dry_run,
                 transform=transform,
+                overwrite=overwrite,
             )
         except Exception as exc:
             _LOGGER.exception(
@@ -673,6 +701,7 @@ async def _do_import(
     gap_threshold_minutes: int = 60,
     dry_run: bool = False,
     transform: Callable[[float], float] | None = None,
+    overwrite: bool = False,
 ) -> None:
     """Execute the actual import. Separated for clean lock/error handling."""
     recorder = get_instance(hass)
@@ -719,24 +748,11 @@ async def _do_import(
         )
 
         # --- 2. Insert states in a single ATOMIC transaction ---
-        # The cutoff (destination's oldest timestamp) is queried INSIDE the same
-        # transaction as the insert, so there is no TOCTOU race. The query uses
-        # MIN(last_updated_ts) which captures ALL row types (value changes AND
-        # attribute-only changes).
-        (
-            imported,
-            already_covered,
-            mid_stream_filled,
-            trailing_filled,
-            source_skipped_non_good,
-            dest_total_rows,
-            dest_good_rows,
-            gap_intervals_count,
-            _cutoff_ts,
-            imported_min_ts,
-            imported_max_ts,
-            debug_states,
-        ) = await recorder.async_add_executor_job(
+        # The cutoff (the destination's oldest GOOD timestamp) is queried INSIDE
+        # the same transaction as the insert, so there is no TOCTOU race. In
+        # overwrite mode this step also deletes the destination rows it replaces,
+        # in that same transaction.
+        states_out = await recorder.async_add_executor_job(
             partial(
                 _insert_states_atomic,
                 recorder,
@@ -746,23 +762,36 @@ async def _do_import(
                 gap_threshold_minutes=gap_threshold_minutes,
                 dry_run=dry_run,
                 transform=transform,
+                overwrite=overwrite,
             )
         )
-        result["states_imported"] = imported
-        result["states_already_covered"] = already_covered
-        result["states_mid_stream_filled"] = mid_stream_filled
-        result["states_trailing_filled"] = trailing_filled
-        result["states_source_skipped_non_good"] = source_skipped_non_good
-        result["states_dest_total_rows"] = dest_total_rows
-        result["states_dest_good_rows"] = dest_good_rows
-        result["states_gap_intervals_count"] = gap_intervals_count
-        result["debug_states"] = debug_states
+        result["states_imported"] = states_out["inserted"]
+        result["states_already_covered"] = states_out["already_covered"]
+        result["states_mid_stream_filled"] = states_out["mid_stream_filled"]
+        result["states_trailing_filled"] = states_out["trailing_filled"]
+        result["states_source_skipped_non_good"] = states_out[
+            "source_skipped_non_good"
+        ]
+        result["states_dest_total_rows"] = states_out["dest_total_rows"]
+        result["states_dest_good_rows"] = states_out["dest_good_rows"]
+        result["states_gap_intervals_count"] = states_out["gap_intervals_count"]
+        result["states_overwritten"] = states_out["overwritten"]
+        span = states_out.get("overwrite_span")
+        if span:
+            result["states_overwrite_start"] = datetime.fromtimestamp(
+                span[0], tz=timezone.utc
+            ).isoformat()
+            result["states_overwrite_end"] = datetime.fromtimestamp(
+                span[1], tz=timezone.utc
+            ).isoformat()
+        result["debug_states"] = states_out["debug_records"]
+        imported_min_ts = states_out["imported_min_ts"]
         if imported_min_ts is not None:
             result["states_imported_start"] = datetime.fromtimestamp(
                 imported_min_ts, tz=timezone.utc
             ).isoformat()
             result["states_imported_end"] = datetime.fromtimestamp(
-                imported_max_ts, tz=timezone.utc
+                states_out["imported_max_ts"], tz=timezone.utc
             ).isoformat()
 
     # --- 3. Import statistics (gap-fill semantics) ---
@@ -776,7 +805,12 @@ async def _do_import(
     # Done independently: a stats failure should not hide a successful states import.
     try:
         stats_result = await _async_import_statistics_for_pair(
-            hass, source_id, dest_id, dry_run=dry_run, transform=transform
+            hass,
+            source_id,
+            dest_id,
+            dry_run=dry_run,
+            transform=transform,
+            overwrite=overwrite,
         )
         result.update(stats_result)
     except Exception as exc:
@@ -793,7 +827,10 @@ async def _do_import(
     # We only do this when the user opts in via fill_gaps, because short-term
     # cells are dense (12/hour) and the 5-min compile cycle makes the race
     # window tighter than for hourly LTS.
-    if fill_gaps:
+    # Overwrite also runs it: replacing known-bad recent data is exactly the
+    # case it exists for, and requiring a second unrelated checkbox to reach
+    # the 5-minute rows would leave the recent graph half-corrected.
+    if fill_gaps or overwrite:
         try:
             short_result = await _async_import_short_term_statistics_for_pair(
                 hass,
@@ -802,6 +839,7 @@ async def _do_import(
                 gap_threshold_minutes=gap_threshold_minutes,
                 dry_run=dry_run,
                 transform=transform,
+                overwrite=overwrite,
             )
             result.update(short_result)
         except Exception as exc:
@@ -889,26 +927,22 @@ def _insert_states_atomic(
     gap_threshold_minutes: int = 60,
     dry_run: bool = False,
     transform: Callable[[float], float] | None = None,
-) -> tuple[
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    int,
-    float | None,
-    float | None,
-    float | None,
-    list[dict],
-]:
+    overwrite: bool = False,
+) -> dict[str, Any]:
     """Insert State objects into the recorder database for a destination entity.
 
     This function is ATOMIC: either ALL states are committed, or NONE are
     (full rollback on any error).
 
-    Import rules:
+    **Overwrite mode (`overwrite=True`) is destructive.** Every destination row
+    inside the source's time span is DELETED and replaced by the source's
+    states, regardless of `fill_gaps`. Rows outside that span are untouched.
+    This is the only mode that removes existing data; it exists for
+    destinations holding known-bad values (a sensor that logged zeros while it
+    was being commissioned, or an earlier import made with the wrong unit).
+    Deleted rows cannot be recovered without a database backup.
+
+    Import rules (when `overwrite` is False):
     - **Head fill (always):** any source state strictly older than the
       destination's oldest GOOD entry is imported. Hidden rows (unavailable/
       unknown) do not count as coverage — a destination whose earliest rows
@@ -930,13 +964,12 @@ def _insert_states_atomic(
 
     Idempotency: head-fill moves the cutoff earlier on re-run; gap-fill modes
     close the gaps they fill, so a re-run sees the same (or no remaining) gaps.
+    Overwrite re-runs are also stable: the second run deletes the rows the
+    first one wrote and rewrites identical values.
 
-    Returns (inserted, already_covered, mid_stream_filled, trailing_filled,
-    source_skipped_non_good, dest_total_rows, dest_good_rows,
-    gap_intervals_count, cutoff_ts, imported_min_ts, imported_max_ts,
-    debug_records). imported_min_ts / imported_max_ts are None if nothing was
-    imported. debug_records is one dict per source state with its decision
-    and the adjacent destination context.
+    Returns a dict of counters plus `imported_min_ts` / `imported_max_ts`
+    (None if nothing was imported) and `debug_records`, one entry per source
+    state with its decision and the adjacent destination context.
     """
     inserted = 0
     imported_min_ts: float | None = None
@@ -947,6 +980,8 @@ def _insert_states_atomic(
     dest_total_rows = 0
     dest_good_rows = 0
     gap_intervals_count = 0
+    overwritten = 0
+    overwrite_span: tuple[float, float] | None = None
     debug_records: list[dict] = []
     session = recorder_instance.get_session()
 
@@ -981,7 +1016,9 @@ def _insert_states_atomic(
         # for same-timestamp dedup instead, which also keeps head fill
         # idempotent when the imported head states are themselves non-good.
         head_dedup_ts: set[float] = set()
-        if metadata_id == -1:
+        if metadata_id == -1 or overwrite:
+            # Overwrite replaces the whole source span, so neither the cutoff
+            # nor the head-dedup set is consulted.
             min_ts = None
         else:
             min_ts = (
@@ -1006,7 +1043,85 @@ def _insert_states_atomic(
         # Single classification pass: each source state is either head /
         # mid_stream / trailing / various skip reasons. The same pass produces
         # the per-row debug_records list returned to the UI.
-        if min_ts is None and not head_dedup_ts:
+        if overwrite:
+            # DESTRUCTIVE path: delete every destination row inside the
+            # source's span, then import the full source series. Runs in the
+            # same transaction as the inserts, so a failure rolls the deletes
+            # back too.
+            to_import = list(source_states)
+            # The span is the source's own data range, so the blast radius is
+            # exactly what the source can replace. It is reported back to the
+            # UI so the user sees the window before (and after) committing.
+            span_lo = min(s.last_updated.timestamp() for s in source_states)
+            span_hi = max(s.last_updated.timestamp() for s in source_states)
+            overwrite_span = (span_lo, span_hi)
+
+            doomed_ids: list[int] = []
+            if metadata_id != -1:
+                doomed_ids = [
+                    row[0]
+                    for row in session.query(States.state_id)
+                    .filter(
+                        States.metadata_id == metadata_id,
+                        States.last_updated_ts >= span_lo,
+                        States.last_updated_ts <= span_hi,
+                    )
+                    .all()
+                ]
+            overwritten = len(doomed_ids)
+
+            if doomed_ids and not dry_run:
+                # Rows OUTSIDE the deleted range can reference a deleted row
+                # through old_state_id (a self-referencing FK). Null those out
+                # first, exactly as HA's own purge does, or the DELETE fails
+                # on engines that enforce the constraint. Chunked to stay
+                # under SQLite's bound-parameter limit.
+                chunk_size = 500
+                for i in range(0, len(doomed_ids), chunk_size):
+                    chunk = doomed_ids[i : i + chunk_size]
+                    session.query(States).filter(
+                        States.old_state_id.in_(chunk)
+                    ).update({States.old_state_id: None}, synchronize_session=False)
+                for i in range(0, len(doomed_ids), chunk_size):
+                    chunk = doomed_ids[i : i + chunk_size]
+                    session.query(States).filter(
+                        States.state_id.in_(chunk)
+                    ).delete(synchronize_session=False)
+                session.flush()
+
+            for s in source_states:
+                src_val = str(s.state) if s.state is not None else None
+                rec = {
+                    "ts": s.last_updated.isoformat(),
+                    "ts_epoch": s.last_updated.timestamp(),
+                    "source_value": src_val,
+                    "dest_has_row_at_same_ts": None,
+                    "prev_dest_good_ts": None,
+                    "next_dest_good_ts": None,
+                    "gap_minutes": None,
+                    "decision": "overwrite_imported",
+                    "reason": (
+                        "Overwrite mode: destination rows in the source's time "
+                        "span were removed and replaced by the source series."
+                    ),
+                }
+                if transform is not None:
+                    rec["scaled_value"] = _scale_state_value(src_val, transform)
+                debug_records.append(rec)
+
+            _LOGGER.warning(
+                "OVERWRITE %s: %s %d destination state rows between %s and %s, "
+                "%s %d source states (dry_run=%s)",
+                dest_entity_id,
+                "would delete" if dry_run else "deleted",
+                overwritten,
+                datetime.fromtimestamp(span_lo, tz=timezone.utc).isoformat(),
+                datetime.fromtimestamp(span_hi, tz=timezone.utc).isoformat(),
+                "would import" if dry_run else "importing",
+                len(to_import),
+                dry_run,
+            )
+        elif min_ts is None and not head_dedup_ts:
             to_import = list(source_states)
             for s in source_states:
                 src_val = str(s.state) if s.state is not None else None
@@ -1268,20 +1383,22 @@ def _insert_states_atomic(
                     imported_min_ts = to_import[0].last_updated.timestamp()
                     imported_max_ts = to_import[-1].last_updated.timestamp()
 
-            return (
-                inserted,
-                already_covered,
-                mid_stream_filled,
-                trailing_filled,
-                source_skipped_non_good,
-                dest_total_rows,
-                dest_good_rows,
-                gap_intervals_count,
-                min_ts,
-                imported_min_ts,
-                imported_max_ts,
-                debug_records,
-            )
+            return {
+                "inserted": inserted,
+                "already_covered": already_covered,
+                "mid_stream_filled": mid_stream_filled,
+                "trailing_filled": trailing_filled,
+                "source_skipped_non_good": source_skipped_non_good,
+                "dest_total_rows": dest_total_rows,
+                "dest_good_rows": dest_good_rows,
+                "gap_intervals_count": gap_intervals_count,
+                "overwritten": overwritten,
+                "overwrite_span": overwrite_span,
+                "cutoff_ts": min_ts,
+                "imported_min_ts": imported_min_ts,
+                "imported_max_ts": imported_max_ts,
+                "debug_records": debug_records,
+            }
 
         # Ensure to_import is sorted chronologically for min/max and a stable
         # FK-friendly insertion order (head is oldest, then mid-stream, then
@@ -1353,36 +1470,41 @@ def _insert_states_atomic(
         # -- SINGLE commit: all or nothing --
         session.commit()
         _LOGGER.info(
-            "Committed %d states for %s (%d source states already covered)",
+            "Committed %d states for %s (%d source states already covered, "
+            "%d destination rows replaced)",
             inserted,
             dest_entity_id,
             already_covered,
+            overwritten,
         )
 
     except Exception:
         session.rollback()
         _LOGGER.error(
-            "Rolling back entire import for %s — no states were written",
+            "Rolling back entire import for %s — no states were written "
+            "and no rows were deleted",
             dest_entity_id,
         )
         raise
     finally:
         session.close()
 
-    return (
-        inserted,
-        already_covered,
-        mid_stream_filled,
-        trailing_filled,
-        source_skipped_non_good,
-        dest_total_rows,
-        dest_good_rows,
-        gap_intervals_count,
-        min_ts,
-        imported_min_ts,
-        imported_max_ts,
-        debug_records,
-    )
+    return {
+        "inserted": inserted,
+        "already_covered": already_covered,
+        "mid_stream_filled": mid_stream_filled,
+        "trailing_filled": trailing_filled,
+        "source_skipped_non_good": source_skipped_non_good,
+        "dest_total_rows": dest_total_rows,
+        "dest_good_rows": dest_good_rows,
+        "gap_intervals_count": gap_intervals_count,
+        "overwritten": overwritten,
+        "overwrite_span": overwrite_span,
+        "cutoff_ts": min_ts,
+        "imported_min_ts": imported_min_ts,
+        "imported_max_ts": imported_max_ts,
+        "debug_records": debug_records,
+    }
 
 
 def _get_or_create_attributes(
@@ -1494,6 +1616,7 @@ def _build_stats_debug_records(
     dest_max_ts: float | None = None,
     trailing_allowed: bool = True,
     gap_threshold_minutes: int | None = None,
+    overwrite: bool = False,
 ) -> list[dict]:
     """Per-source-row classification used for the downloadable debug JSON.
 
@@ -1546,6 +1669,26 @@ def _build_stats_debug_records(
             )
             if sum_offset is not None and "sum" in src_values:
                 rec["applied_sum_offset"] = sum_offset
+        elif overwrite:
+            dest_values = {
+                k: dest_row[k] for k in stat_cols if dest_row.get(k) is not None
+            }
+            merged = dict(dest_values)
+            merged.update(src_values)
+            if merged == dest_values:
+                rec["decision"] = "already_complete"
+                rec["reason"] = (
+                    "Destination already holds exactly these values."
+                )
+            else:
+                rec["decision"] = "overwritten"
+                rec["reason"] = (
+                    "Overwrite mode: destination values replaced by the "
+                    "source's for column(s) "
+                    + ", ".join(sorted(src_values))
+                )
+                if sum_offset is not None and "sum" in src_values:
+                    rec["applied_sum_offset"] = sum_offset
         else:
             dest_values = {
                 k: dest_row[k] for k in stat_cols if dest_row.get(k) is not None
@@ -1578,6 +1721,7 @@ async def _async_import_statistics_for_pair(
     *,
     dry_run: bool = False,
     transform: Callable[[float], float] | None = None,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
     """Import long-term statistics from source to destination — gap-fill mode.
 
@@ -1588,6 +1732,11 @@ async def _async_import_statistics_for_pair(
        This prevents the previous upsert behavior from accidentally nulling out
        populated columns (e.g. setting `sum=NULL` because the source row only
        had `mean` set — `_update_statistics` uses `.get()` for every column).
+       When `overwrite` is True this inverts: the source's values win for every
+       column it provides, and only columns the source lacks keep the
+       destination's values. The splice offset is then computed against the
+       destination rows that SURVIVE (those outside the source's coverage),
+       since the overwritten ones no longer define the join point.
 
     2. **Recent-hour cutoff.** The last fully-compiled hour is `floor_hour(now)`;
        we stop one hour before that to leave a safety margin against HA's own
@@ -1615,6 +1764,7 @@ async def _async_import_statistics_for_pair(
         "stats_already_covered": 0,
         "stats_skipped_recent": 0,
         "stats_gap_filled": 0,  # hours where dest had a row but NULL in some column source provides
+        "stats_overwritten": 0,  # hours whose existing values were replaced
         "stats_imported_start": None,
         "stats_imported_end": None,
         "stats_sum_offset": None,
@@ -1657,7 +1807,22 @@ async def _async_import_statistics_for_pair(
     source_rows = _scale_stat_rows(source_rows, transform)
 
     # -- Compute sum offset (None if not applicable) --
-    sum_offset = _compute_sum_offset(source_rows, dest_rows)
+    # In overwrite mode the destination rows the source is about to replace no
+    # longer define where the two series join: the splice point is the earliest
+    # SURVIVING destination row, so those are the only ones considered.
+    if overwrite:
+        replaced_ts = {
+            _row_start_ts(r)
+            for r in source_rows
+            if _row_start_ts(r) <= recent_cutoff_ts
+            and any(r.get(k) is not None for k in ("mean", "min", "max", "sum", "state"))
+        }
+        surviving_dest_rows = [
+            r for r in dest_rows if _row_start_ts(r) not in replaced_ts
+        ]
+    else:
+        surviving_dest_rows = dest_rows
+    sum_offset = _compute_sum_offset(source_rows, surviving_dest_rows)
 
     # -- Build destination row lookup by start_ts --
     # IMPORTANT: a row existing at a given hour does NOT mean it's "covered".
@@ -1678,12 +1843,14 @@ async def _async_import_statistics_for_pair(
     already_covered = 0
     skipped_recent = 0
     gap_filled = 0
+    overwritten = 0
     debug_stats = _build_stats_debug_records(
         source_rows,
         dest_by_start,
         stat_cols,
         recent_cutoff_ts,
         sum_offset,
+        overwrite=overwrite,
     )
 
     for src_row in source_rows:
@@ -1709,6 +1876,23 @@ async def _async_import_statistics_for_pair(
             continue
 
         dest_values = {k: dest_row[k] for k in stat_cols if dest_row.get(k) is not None}
+
+        if overwrite:
+            # Source wins for every column it provides; columns it does not
+            # provide keep the destination's value rather than being nulled.
+            data = dict(dest_values)
+            for k, v in src_values.items():
+                if k == "sum" and sum_offset is not None:
+                    v = float(v) + sum_offset
+                data[k] = v
+            if data == dest_values:
+                # Identical values already stored (e.g. a repeat run).
+                already_covered += 1
+                continue
+            to_import_rows.append((start_ts, data))
+            overwritten += 1
+            continue
+
         fillable = {k: v for k, v in src_values.items() if k not in dest_values}
 
         if not fillable:
@@ -1732,6 +1916,7 @@ async def _async_import_statistics_for_pair(
     out["stats_already_covered"] = already_covered
     out["stats_skipped_recent"] = skipped_recent
     out["stats_gap_filled"] = gap_filled
+    out["stats_overwritten"] = overwritten
     out["debug_stats"] = debug_stats
 
     if not to_import_rows:
@@ -1843,7 +2028,9 @@ async def _async_import_statistics_for_pair(
     # Do not revert this to touch only imported rows without re-checking that trace.
     if sum_offset is not None:
         dest_sum_ts = [
-            _row_start_ts(r) for r in dest_rows if r.get("sum") is not None
+            _row_start_ts(r)
+            for r in surviving_dest_rows
+            if r.get("sum") is not None
         ]
         imported_sum_ts = [ts for ts, data in to_import_rows if "sum" in data]
         if (
@@ -1865,12 +2052,13 @@ async def _async_import_statistics_for_pair(
     _LOGGER.info(
         "%s %d statistics rows for %s "
         "(%d already complete in destination, %d gap-filled (NULL columns), "
-        "%d skipped as too recent, sum offset: %s)",
+        "%d overwritten, %d skipped as too recent, sum offset: %s)",
         "Would queue" if dry_run else "Queued",
         len(stats_data),
         dest_id,
         already_covered,
         gap_filled,
+        overwritten,
         skipped_recent,
         sum_offset,
     )
@@ -1940,10 +2128,12 @@ async def _async_import_short_term_statistics_for_pair(
     gap_threshold_minutes: int,
     dry_run: bool = False,
     transform: Callable[[float], float] | None = None,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
     """Backfill short-term (5-minute) statistics from source to destination.
 
-    Opt-in via the `fill_gaps` flag. Behaviors:
+    Opt-in via the `fill_gaps` flag (or `overwrite`, which targets existing
+    data by definition). Behaviors:
 
     1. **Gap-fill, not overwrite.** Only inserts for 5-min slots where the
        destination has no existing short-term row, using the same column-merge
@@ -1973,6 +2163,7 @@ async def _async_import_short_term_statistics_for_pair(
         "stats_short_imported": 0,
         "stats_short_already_covered": 0,
         "stats_short_skipped_recent": 0,
+        "stats_short_overwritten": 0,
         "stats_short_imported_start": None,
         "stats_short_imported_end": None,
         "debug_stats_short": [],
@@ -2003,16 +2194,30 @@ async def _async_import_short_term_statistics_for_pair(
     source_rows = _scale_stat_rows(source_rows, transform)
 
     # -- Reuse LTS splice-offset logic (works identically on 5-min rows) --
-    sum_offset = _compute_sum_offset(source_rows, dest_rows)
+    # Same surviving-rows rule as the LTS path in overwrite mode.
+    if overwrite:
+        replaced_ts = {
+            _row_start_ts(r)
+            for r in source_rows
+            if _row_start_ts(r) <= recent_cutoff_ts
+            and any(r.get(k) is not None for k in ("mean", "min", "max", "sum", "state"))
+        }
+        surviving_dest_rows = [
+            r for r in dest_rows if _row_start_ts(r) not in replaced_ts
+        ]
+    else:
+        surviving_dest_rows = dest_rows
+    sum_offset = _compute_sum_offset(source_rows, surviving_dest_rows)
 
     dest_by_start: dict[float, dict] = {_row_start_ts(r): r for r in dest_rows}
 
     # Trailing-edge threshold: only fill slots after dest_max_ts if the gap
-    # from there to now() meets the user's threshold.
+    # from there to now() meets the user's threshold. Overwrite bypasses the
+    # gate: it replaces the source's whole span, trailing slots included.
     threshold_sec = gap_threshold_minutes * 60.0
     dest_max_ts: float | None = None
     trailing_allowed = True
-    if dest_rows:
+    if dest_rows and not overwrite:
         dest_max_ts = max(_row_start_ts(r) for r in dest_rows)
         trailing_allowed = (now.timestamp() - dest_max_ts) >= threshold_sec
 
@@ -2021,6 +2226,7 @@ async def _async_import_short_term_statistics_for_pair(
     to_import_rows: list[tuple[float, dict[str, Any]]] = []
     already_covered = 0
     skipped_recent = 0
+    overwritten = 0
     debug_stats_short = _build_stats_debug_records(
         source_rows,
         dest_by_start,
@@ -2030,6 +2236,7 @@ async def _async_import_short_term_statistics_for_pair(
         dest_max_ts=dest_max_ts,
         trailing_allowed=trailing_allowed,
         gap_threshold_minutes=gap_threshold_minutes,
+        overwrite=overwrite,
     )
 
     for src_row in source_rows:
@@ -2063,6 +2270,20 @@ async def _async_import_short_term_statistics_for_pair(
             continue
 
         dest_values = {k: dest_row[k] for k in stat_cols if dest_row.get(k) is not None}
+
+        if overwrite:
+            data = dict(dest_values)
+            for k, v in src_values.items():
+                if k == "sum" and sum_offset is not None:
+                    v = float(v) + sum_offset
+                data[k] = v
+            if data == dest_values:
+                already_covered += 1
+                continue
+            to_import_rows.append((start_ts, data))
+            overwritten += 1
+            continue
+
         fillable = {k: v for k, v in src_values.items() if k not in dest_values}
         if not fillable:
             already_covered += 1
@@ -2078,6 +2299,7 @@ async def _async_import_short_term_statistics_for_pair(
 
     out["stats_short_already_covered"] = already_covered
     out["stats_short_skipped_recent"] = skipped_recent
+    out["stats_short_overwritten"] = overwritten
     out["debug_stats_short"] = debug_stats_short
 
     if not to_import_rows:

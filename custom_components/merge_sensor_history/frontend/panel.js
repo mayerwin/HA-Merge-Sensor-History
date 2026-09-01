@@ -606,6 +606,27 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           opacity: 0.5;
           pointer-events: none;
         }
+        .option-row.danger input[type="checkbox"] {
+          accent-color: var(--error-color, #db4437);
+        }
+        .option-row.danger .option-label {
+          color: var(--error-color, #db4437);
+          font-weight: 600;
+        }
+        .danger-note {
+          margin-top: 8px;
+          padding: 10px 12px;
+          border: 1px solid var(--error-color, #db4437);
+          border-left-width: 4px;
+          border-radius: 6px;
+          background: rgba(219, 68, 55, 0.08);
+          color: var(--primary-text-color);
+          font-size: 12px;
+          line-height: 1.5;
+        }
+        .danger-note.hidden {
+          display: none;
+        }
         .option-row.sub-row .option-label {
           font-weight: 400;
           color: var(--secondary-text-color);
@@ -779,6 +800,14 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             <span class="option-hint" id="custom-fn-preview"></span>
             <span class="option-hint">&mdash; a math formula of <strong>v</strong> (the source value), evaluated safely (never as JavaScript). Allowed: numbers, + - * / % ^ ( ) and abs, round, floor, ceil, sqrt, log, log10, exp, min, max, pow, pi, e. Applied to states and statistics; energy totals are spliced after conversion; non-numeric states pass through. For cumulative (energy-style) sensors keep the formula linear, like a*v + b, so hourly deltas stay correct.</span>
           </div>
+          <label class="option-row danger" style="margin-top:14px" title="Replaces the destination's data with the source's wherever the source has data, instead of only filling holes. Destination state rows inside the source's time span are deleted. This cannot be undone without a database backup.">
+            <input type="checkbox" id="overwrite-cb" />
+            <span class="option-label">&#9888;&#65039; Overwrite existing destination data (destructive)</span>
+          </label>
+          <div class="danger-note hidden" id="overwrite-note">
+            <strong>This deletes data.</strong> Every destination state row inside the source's time span is removed and replaced by the source's states, and existing statistics values are overwritten wherever the source has data. Values the source does not provide are kept, and the most recent slots Home Assistant may still be compiling are still skipped.<br />
+            Use it only when the destination holds data you know is wrong, for example zeros logged while a sensor was being commissioned, or an earlier import made with the wrong unit. <strong>Back up your database first</strong> and run <strong>Preview</strong> to see the row counts. Deleted rows cannot be recovered.
+          </div>
         </div>
         <div class="actions">
           <div style="flex:1"></div>
@@ -817,10 +846,21 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     this._customFnPreview = shadow.getElementById("custom-fn-preview");
     this._showDeletedCb = shadow.getElementById("show-deleted-cb");
     this._deletedStatus = shadow.getElementById("deleted-status");
+    this._overwriteCb = shadow.getElementById("overwrite-cb");
+    this._overwriteNote = shadow.getElementById("overwrite-note");
 
     this._showDeletedCb.addEventListener("change", () =>
       this._onShowDeletedChange()
     );
+
+    // The full warning only unfolds once the box is ticked, so the panel stays
+    // calm for the majority who never need this.
+    this._overwriteCb.addEventListener("change", () => {
+      this._overwriteNote.classList.toggle(
+        "hidden",
+        !this._overwriteCb.checked
+      );
+    });
 
     const syncGapThresholdEnabled = () => {
       this._gapThresholdRow.classList.toggle(
@@ -1415,6 +1455,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     }
 
     const fillGaps = !!this._fillGapsCb.checked;
+    const overwrite = !!this._overwriteCb.checked;
     let gapThresholdMinutes = Number(this._gapThreshold.value);
     if (fillGaps) {
       if (
@@ -1485,6 +1526,25 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       ) {
         return;
       }
+
+      // Overwrite deletes rows, so it gets its own explicit confirmation
+      // naming the destinations that lose data.
+      if (overwrite) {
+        const dests = [...new Set(validPairs.map((p) => p.destination))];
+        if (
+          !confirm(
+            "⚠️ OVERWRITE IS ON. THIS DELETES DATA.\n\n" +
+              "For these destination entities, every state row inside the " +
+              "source's time span will be deleted and replaced, and existing " +
+              "statistics values will be overwritten:\n\n" +
+              dests.map((d) => `  ${d}`).join("\n") +
+              "\n\nDeleted rows cannot be recovered without a database backup." +
+              "\n\nContinue?"
+          )
+        ) {
+          return;
+        }
+      }
     }
 
     this._importing = true;
@@ -1504,6 +1564,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         fill_gaps: fillGaps,
         gap_threshold_minutes: gapThresholdMinutes,
         dry_run: dryRun,
+        overwrite: overwrite,
         scale_factor: scaleFactor,
         value_function: valueFunction,
       });
@@ -1656,6 +1717,11 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           grid += `<span class="result-stat-range" style="grid-column:1/-1">Source has no raw state history (a deleted entity, or states purged). Only statistics ${r.dry_run ? "would be" : "were"} merged; the History panel stays empty while the Energy dashboard and long-term graphs are filled.</span>`;
         }
 
+        // --- Overwrite notice ---
+        if (r.overwrite) {
+          grid += `<span class="result-stat-range" style="grid-column:1/-1;color:var(--error-color,#db4437)">&#9888;&#65039; <strong>Overwrite ${r.dry_run ? "would be" : "was"} used.</strong> Destination data inside the source's time span ${r.dry_run ? "would be" : "was"} replaced by the source's.</span>`;
+        }
+
         // --- Value adjustment notice ---
         if (r.value_function) {
           const esc = String(r.value_function)
@@ -1671,9 +1737,14 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         if (r.states_source_total > 0) {
           grid += `<span class="result-stat-label">States ${dlBtn("states", (r.debug_states || []).length)}</span><span class="result-stat-label"></span>`;
           grid += `<span class="result-stat-value">${r.states_source_total.toLocaleString()}</span><span class="result-stat-label">total in source</span>`;
+          if (r.states_overwritten > 0) {
+            grid += `<span class="result-stat-value">${r.states_overwritten.toLocaleString()}</span><span class="result-stat-label">destination rows ${r.dry_run ? "would be deleted" : "deleted"} and replaced</span>`;
+            if (r.states_overwrite_start && r.states_overwrite_end)
+              grid += `<span class="result-stat-range" style="grid-column:1/-1">Replaced window: ${this._formatTs(r.states_overwrite_start)} → ${this._formatTs(r.states_overwrite_end)}</span>`;
+          }
           if (r.states_already_covered > 0)
             grid += `<span class="result-stat-value">${r.states_already_covered.toLocaleString()}</span><span class="result-stat-label">already present in destination</span>`;
-          if (!r.fill_gaps && r.states_already_covered > 0)
+          if (!r.fill_gaps && !r.overwrite && r.states_already_covered > 0)
             grid += `<span class="result-stat-range" style="grid-column:1/-1">Skipped states fall inside the destination's existing range. If part of that range looks empty in the History panel, enable <strong>Fill mid-stream gaps</strong> under Options and run a Preview to see what could be imported.</span>`;
           grid += `<span class="result-stat-value">${r.states_imported.toLocaleString()}</span><span class="result-stat-label">${actionVerb}</span>`;
           if (r.states_mid_stream_filled > 0)
@@ -1709,6 +1780,8 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             grid += `<span class="result-stat-value">${r.stats_already_covered.toLocaleString()}</span><span class="result-stat-label">already complete in destination</span>`;
           if (r.stats_gap_filled > 0)
             grid += `<span class="result-stat-value">${r.stats_gap_filled.toLocaleString()}</span><span class="result-stat-label">gap-filled (NULL columns in destination)</span>`;
+          if (r.stats_overwritten > 0)
+            grid += `<span class="result-stat-value">${r.stats_overwritten.toLocaleString()}</span><span class="result-stat-label">existing hours ${r.dry_run ? "would be overwritten" : "overwritten"}</span>`;
           if (r.stats_skipped_recent > 0)
             grid += `<span class="result-stat-value">${r.stats_skipped_recent.toLocaleString()}</span><span class="result-stat-label">skipped (recent &mdash; not yet compiled by HA)</span>`;
           grid += `<span class="result-stat-value">${(r.stats_imported || 0).toLocaleString()}</span><span class="result-stat-label">total ${actionVerb}</span>`;
@@ -1743,6 +1816,8 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             grid += `<span class="result-stat-value">${r.stats_short_source_total.toLocaleString()}</span><span class="result-stat-label">total in source</span>`;
           if (r.stats_short_already_covered > 0)
             grid += `<span class="result-stat-value">${r.stats_short_already_covered.toLocaleString()}</span><span class="result-stat-label">already complete in destination</span>`;
+          if (r.stats_short_overwritten > 0)
+            grid += `<span class="result-stat-value">${r.stats_short_overwritten.toLocaleString()}</span><span class="result-stat-label">existing slots ${r.dry_run ? "would be overwritten" : "overwritten"}</span>`;
           if (r.stats_short_skipped_recent > 0)
             grid += `<span class="result-stat-value">${r.stats_short_skipped_recent.toLocaleString()}</span><span class="result-stat-label">skipped (too recent or under threshold)</span>`;
           grid += `<span class="result-stat-value">${(r.stats_short_imported || 0).toLocaleString()}</span><span class="result-stat-label">${actionVerb}</span>`;
