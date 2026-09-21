@@ -10,6 +10,8 @@ import json
 import logging
 import math
 import os
+import threading
+import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -17,6 +19,7 @@ from typing import Any
 
 import voluptuous as vol
 from sqlalchemy import func as sql_func
+from sqlalchemy import text as sql_text
 
 from homeassistant.components import websocket_api
 from homeassistant.components.frontend import (
@@ -51,6 +54,8 @@ from homeassistant.components.recorder.db_schema import (
     States,
     StateAttributes,
     StatesMeta,
+    Statistics,
+    StatisticsMeta,
     StatisticsShortTerm,
 )
 from homeassistant.config_entries import ConfigEntry
@@ -67,6 +72,49 @@ _EPOCH = datetime(2000, 1, 1, tzinfo=timezone.utc)
 # State values that HA hides in the History panel — also excluded from
 # gap-detection so a long unavailable streak registers as a fillable gap.
 _NON_GOOD_STATES = frozenset({"unavailable", "unknown"})
+
+# --- Write pacing -----------------------------------------------------------
+# SQLite allows a single writer at a time. The recorder commits its own event
+# queue roughly once a second on a DIFFERENT connection than the one this
+# integration writes through (HA's RecorderPool hands every worker thread its
+# own connection), so a write transaction we hold blocks the recorder for as
+# long as it stays open. Holding one transaction for a whole import therefore
+# starved the recorder: "database is locked" every few seconds, an event queue
+# growing without bound, and a Home Assistant restart — which drops that queue,
+# losing history — as the only way out.
+#
+# So the import writes in bounded chunks, committing each one and pausing
+# briefly in between to hand the write lock back. The chunk size is a
+# compromise: large enough that per-transaction overhead stays negligible,
+# small enough that a chunk commits well inside the recorder's lock wait.
+_WRITE_CHUNK_ROWS = 2000
+# Pause after each committed chunk so the recorder's pending commit can take
+# the write lock instead of spinning on it.
+_WRITE_CHUNK_PAUSE_S = 0.05
+# Wait this long for the write lock rather than failing instantly when the
+# recorder happens to hold it (the driver default is 5s, which a busy recorder
+# can exceed while flushing a large batch).
+_SQLITE_BUSY_TIMEOUT_MS = 30_000
+
+
+def _set_sqlite_busy_timeout(session: Any) -> None:
+    """Make this connection wait for the write lock instead of failing fast.
+
+    No-op on any engine other than SQLite. A failure here is not fatal: the
+    import still works with the driver default, it is just less tolerant of a
+    momentarily busy recorder.
+    """
+    try:
+        bind = session.get_bind()
+        if bind is None or bind.dialect.name != "sqlite":
+            return
+        session.execute(
+            sql_text(f"PRAGMA busy_timeout = {_SQLITE_BUSY_TIMEOUT_MS}")
+        )
+    except Exception:  # pragma: no cover - best effort tuning only
+        _LOGGER.debug(
+            "Could not set busy_timeout on the import connection", exc_info=True
+        )
 
 
 # --- Safe value-adjustment expressions ------------------------------------
@@ -317,6 +365,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Merge Sensor History from a config entry."""
     domain_data = hass.data.setdefault(DOMAIN, {})
     domain_data.setdefault("_locks", {})
+    # Cancel events for imports currently writing to the database, so unloading
+    # (or reloading) the integration stops them instead of leaving a long
+    # transaction running with no way to reach it.
+    domain_data.setdefault("_cancel_events", set())
 
     # Register the static asset path + sidebar panel. If either step fails we
     # let the exception propagate so the config entry fails to set up — HA shows
@@ -360,6 +412,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register websocket commands
     websocket_api.async_register_command(hass, ws_import_history)
     websocket_api.async_register_command(hass, ws_get_status)
+    websocket_api.async_register_command(hass, ws_repair_sum_series)
 
     # Register service
     async def handle_import_history(call: ServiceCall) -> None:
@@ -434,6 +487,12 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         async_remove_panel(hass, "merge-sensor-history")
 
     hass.services.async_remove(DOMAIN, "import_history")
+
+    # Stop any import still writing. The writer checks between chunks, keeps
+    # what it has already committed and returns; without this, unloading or
+    # reloading the integration left the import running to completion.
+    for cancel_event in list(domain_data.get("_cancel_events", ())):
+        cancel_event.set()
 
     # Intentionally keep hass.data[DOMAIN]: the static asset path registered in
     # async_setup_entry cannot be unregistered (no HA/aiohttp API), so it lives
@@ -516,6 +575,64 @@ async def ws_import_history(
     connection.send_result(msg["id"], {"results": results})
 
 
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "merge_sensor_history/repair_sum_series",
+        vol.Required("statistic_id"): cv.entity_id,
+    }
+)
+@websocket_api.async_response
+async def ws_repair_sum_series(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Put a restarted cumulative series back on top of its own history.
+
+    Offered, never automatic: an import can only stop this happening from now
+    on, so repairing a destination that an earlier version already detached is
+    the user's call. The cliff is re-detected here from the live database
+    rather than trusted from the client, so the caller cannot choose where or
+    by how much the series moves.
+    """
+    statistic_id = msg["statistic_id"]
+    recorder = get_instance(hass)
+
+    try:
+        outcome = await recorder.async_add_executor_job(
+            _repair_sum_series, recorder, statistic_id
+        )
+    except Exception as exc:
+        _LOGGER.error(
+            "Could not repair the running total for %s: %s", statistic_id, exc
+        )
+        connection.send_result(
+            msg["id"], {"repaired": False, "reason": f"Repair failed: {exc}"}
+        )
+        return
+
+    if not outcome["repaired"]:
+        connection.send_result(msg["id"], outcome)
+        return
+
+    start_dt = datetime.fromtimestamp(outcome["start_ts"], tz=timezone.utc)
+    _LOGGER.warning(
+        "Repaired %s: lifted every statistics row from %s onwards by %s so the "
+        "series continues from its own history instead of restarting at zero",
+        statistic_id,
+        start_dt.isoformat(),
+        outcome["lift"],
+    )
+    connection.send_result(
+        msg["id"],
+        {
+            "repaired": True,
+            "lift": outcome["lift"],
+            "start": start_dt.isoformat(),
+            "unit": outcome["unit"],
+        },
+    )
+
+
 @websocket_api.websocket_command(
     {vol.Required("type"): "merge_sensor_history/status"}
 )
@@ -551,12 +668,13 @@ async def _async_import_pair(
       oldest GOOD entry — hidden unavailable/unknown rows don't count as
       coverage — (unless `fill_gaps` is set, which also fills mid-stream
       and trailing gaps in the destination's state history).
-    - The state insertion is ATOMIC (single transaction): either all states
-      are committed, or none are (full rollback).
+    - The state insertion commits in paced chunks rather than one long
+      transaction, so it never locks the recorder out of the database. Chunks
+      are ordered so an interrupted run is resumable.
     - Re-running after success: destination now has older data, so the cutoff
       moves earlier and nothing new qualifies. Zero states imported.
-    - Re-running after failure: the rollback left the DB unchanged, so the
-      same states qualify and are imported from scratch.
+    - Re-running after failure or cancellation: committed chunks are kept, the
+      remaining states still qualify, and the re-run completes the import.
 
     When `fill_gaps` is True, also:
     - Imports source states falling inside any gap in the destination's
@@ -624,6 +742,8 @@ async def _async_import_pair(
         "stats_imported_end": None,  # ISO datetime (hour start) of last imported stat
         "stats_sum_offset": None,  # Applied splice offset (or None) — set only when NOT realigned
         "stats_realigned_by": None,  # Amount the dest running total was lifted (or None)
+        "stats_sum_seeded": None,  # Running total seeded for the destination's future rows
+        "stats_detached": None,  # Detected restart-from-zero cliff, repairable on request
         "stats_unit": None,  # Unit of measurement for display
         # Short-term statistics (5-minute) — populated only when fill_gaps=True
         "stats_short_source_total": 0,
@@ -666,7 +786,11 @@ async def _async_import_pair(
         )
         return result
 
+    cancel_events: set[threading.Event] = hass.data[DOMAIN]["_cancel_events"]
+    cancel_event = threading.Event()
+
     async with locks[dest_id]:
+        cancel_events.add(cancel_event)
         try:
             await _do_import(
                 hass,
@@ -678,6 +802,7 @@ async def _async_import_pair(
                 dry_run=dry_run,
                 transform=transform,
                 overwrite=overwrite,
+                cancel_event=cancel_event,
             )
         except Exception as exc:
             _LOGGER.exception(
@@ -687,6 +812,8 @@ async def _async_import_pair(
                 dry_run,
             )
             result["error"] = f"Import failed: {exc}"
+        finally:
+            cancel_events.discard(cancel_event)
 
     return result
 
@@ -702,6 +829,7 @@ async def _do_import(
     dry_run: bool = False,
     transform: Callable[[float], float] | None = None,
     overwrite: bool = False,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Execute the actual import. Separated for clean lock/error handling."""
     recorder = get_instance(hass)
@@ -747,24 +875,35 @@ async def _do_import(
             source_states[-1].last_updated.isoformat(),
         )
 
-        # --- 2. Insert states in a single ATOMIC transaction ---
-        # The cutoff (the destination's oldest GOOD timestamp) is queried INSIDE
-        # the same transaction as the insert, so there is no TOCTOU race. In
-        # overwrite mode this step also deletes the destination rows it replaces,
-        # in that same transaction.
-        states_out = await recorder.async_add_executor_job(
-            partial(
-                _insert_states_atomic,
-                recorder,
-                dest_id,
-                source_states,
-                fill_gaps=fill_gaps,
-                gap_threshold_minutes=gap_threshold_minutes,
-                dry_run=dry_run,
-                transform=transform,
-                overwrite=overwrite,
+        # --- 2. Insert states, committing in paced chunks ---
+        # A single transaction for the whole import would hold SQLite's only
+        # write lock for its entire duration and lock the recorder out of its
+        # own database, so the writer commits in bounded chunks and pauses
+        # between them. Chunks are ordered so an interrupted run is resumable.
+        # In overwrite mode each chunk also deletes the destination rows it
+        # replaces, in the same transaction as its inserts.
+        # Committed rows are kept when the writer raises part-way, so the
+        # count has to survive the exception for the UI to report it.
+        states_progress: dict[str, int] = {"inserted": 0}
+        try:
+            states_out = await recorder.async_add_executor_job(
+                partial(
+                    _insert_states_chunked,
+                    recorder,
+                    dest_id,
+                    source_states,
+                    fill_gaps=fill_gaps,
+                    gap_threshold_minutes=gap_threshold_minutes,
+                    dry_run=dry_run,
+                    transform=transform,
+                    overwrite=overwrite,
+                    cancel_event=cancel_event,
+                    progress=states_progress,
+                )
             )
-        )
+        except Exception:
+            result["states_imported"] = states_progress["inserted"]
+            raise
         result["states_imported"] = states_out["inserted"]
         result["states_already_covered"] = states_out["already_covered"]
         result["states_mid_stream_filled"] = states_out["mid_stream_filled"]
@@ -793,6 +932,17 @@ async def _do_import(
             result["states_imported_end"] = datetime.fromtimestamp(
                 states_out["imported_max_ts"], tz=timezone.utc
             ).isoformat()
+
+        if states_out.get("cancelled"):
+            # The integration was unloaded or reloaded mid-import. Everything
+            # committed so far is kept and the statistics steps are skipped;
+            # re-running the same import picks up where this one stopped.
+            result["error"] = (
+                f"Import into {dest_id} was cancelled before it finished. "
+                f"{result['states_imported']:,} state(s) were written and have "
+                "been kept. Re-run the same import to complete it."
+            )
+            return
 
     # --- 3. Import statistics (gap-fill semantics) ---
     # Only inserts for hours where the destination has no existing LTS row.
@@ -850,6 +1000,78 @@ async def _do_import(
                 exc,
             )
             result["stats_short_error"] = str(exc)
+
+    # --- 4b. Seed the destination's running total when it has no chain yet ---
+    # Planned by the statistics step (see the note there). Queued here so it
+    # lands after the imported rows, and skipped when the short-term backfill
+    # already wrote recent rows for the destination — the newest of those is
+    # then the seed HA reads.
+    seed = result.pop("_sum_seed", None)
+    if seed and result.get("stats_short_imported", 0):
+        seed = None
+        result["stats_sum_seeded"] = None
+    if seed:
+        if dry_run:
+            _LOGGER.info(
+                "Dry run: would seed %s's running total at %s so its future "
+                "statistics continue from the imported history",
+                dest_id,
+                seed["sum"],
+            )
+        else:
+            try:
+                # Re-check against a fresh reading. The plan was made before
+                # the statistics steps ran, and those can take a while on a
+                # long history; HA compiles a 5-minute row every 5 minutes, so
+                # the destination may have grown a chain of its own since. If
+                # it has, that chain is what HA seeds from and writing an older
+                # row would have no effect.
+                anchor_now = await recorder.async_add_executor_job(
+                    partial(
+                        _fetch_dest_sum_anchor,
+                        recorder,
+                        dest_id,
+                        want_earliest_sum=False,
+                    )
+                )
+                if anchor_now["has_rows"]:
+                    _LOGGER.info(
+                        "Skipped seeding %s's running total: it compiled "
+                        "statistics of its own while this import ran, and "
+                        "Home Assistant continues from those",
+                        dest_id,
+                    )
+                    result["stats_sum_seeded"] = None
+                else:
+                    # The most recent 5-minute slot HA has certainly finished
+                    # compiling, taken now rather than when the plan was made,
+                    # so nothing collides with an in-flight compile.
+                    seed_now = datetime.now(timezone.utc)
+                    seed_start = seed_now.replace(
+                        minute=(seed_now.minute // 5) * 5,
+                        second=0,
+                        microsecond=0,
+                    ) - timedelta(minutes=10)
+                    recorder.async_import_statistics(
+                        seed["metadata"],
+                        [StatisticData(start=seed_start, sum=seed["sum"])],
+                        StatisticsShortTerm,
+                    )
+                    _LOGGER.info(
+                        "Seeded %s's running total at %s (5-minute slot %s) so "
+                        "the statistics Home Assistant compiles from now on "
+                        "continue from the imported history instead of "
+                        "restarting at zero",
+                        dest_id,
+                        seed["sum"],
+                        seed_start.isoformat(),
+                    )
+            except Exception as exc:
+                _LOGGER.warning(
+                    "Could not seed the running total for %s: %s", dest_id, exc
+                )
+                result["stats_seed_error"] = str(exc)
+                result["stats_sum_seeded"] = None
 
     # --- 5. Realign the destination series for a clean head-fill energy import ---
     # See the "series realignment" note in _async_import_statistics_for_pair.
@@ -918,7 +1140,7 @@ async def _do_import(
         )
 
 
-def _insert_states_atomic(
+def _insert_states_chunked(
     recorder_instance: Any,
     dest_entity_id: str,
     source_states: list,
@@ -928,11 +1150,36 @@ def _insert_states_atomic(
     dry_run: bool = False,
     transform: Callable[[float], float] | None = None,
     overwrite: bool = False,
+    cancel_event: threading.Event | None = None,
+    progress: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Insert State objects into the recorder database for a destination entity.
 
-    This function is ATOMIC: either ALL states are committed, or NONE are
-    (full rollback on any error).
+    **Write pacing.** The work is split into a read-only planning phase and a
+    write phase that commits in chunks of `_WRITE_CHUNK_ROWS`, pausing between
+    them. SQLite has a single writer and the recorder commits its own queue on
+    a different connection about once a second, so one long transaction here
+    locks the recorder out for the whole import ("database is locked", an event
+    queue growing until a restart drops it). Chunked commits keep every lock
+    hold short. See the `_WRITE_CHUNK_ROWS` note near the top of this module.
+
+    The trade-off is that an import is no longer all-or-nothing. It is instead
+    **resumable**: each group of states is written in the direction that lets a
+    re-run pick up where an interrupted one stopped.
+
+    - Head fill goes first and writes its newest chunk first, so the
+      destination's coverage grows backwards contiguously and the next run's
+      cutoff resumes exactly at the boundary. It goes first because it is the
+      point of the import; leaving it until last would mean an interrupted run
+      often wrote no history at all.
+    - Trailing fill goes forward in time. Writing its newest states first would
+      move the destination's newest good entry to ~now, which switches the
+      trailing branch off entirely on the next run (it is gated on how far the
+      destination is behind), stranding the states in between.
+    - Mid-stream fill is direction-independent: filling from either end shrinks
+      the gap towards the same residual.
+    - Overwrite replaces one time window per transaction, forwards, so a
+      committed window is never left deleted-but-not-replaced.
 
     **Overwrite mode (`overwrite=True`) is destructive.** Every destination row
     inside the source's time span is DELETED and replaced by the source's
@@ -967,6 +1214,13 @@ def _insert_states_atomic(
     Overwrite re-runs are also stable: the second run deletes the rows the
     first one wrote and rewrites identical values.
 
+    Cancellation: `cancel_event` is checked between chunks. When it is set the
+    writer stops cleanly, keeps what it has already committed, and returns with
+    `cancelled` True.
+
+    `progress` is updated with the committed row count after every chunk, so a
+    caller can still report how much landed when this raises part-way.
+
     Returns a dict of counters plus `imported_min_ts` / `imported_max_ts`
     (None if nothing was imported) and `debug_records`, one entry per source
     state with its decision and the adjacent destination context.
@@ -982,31 +1236,34 @@ def _insert_states_atomic(
     gap_intervals_count = 0
     overwritten = 0
     overwrite_span: tuple[float, float] | None = None
+    # (states, newest_chunk_first) in the order they should be committed.
+    write_groups: list[tuple[list, bool]] = []
+    cancelled = False
     debug_records: list[dict] = []
     session = recorder_instance.get_session()
 
     try:
-        # -- Get or create StatesMeta for destination entity --
-        meta = (
-            session.query(StatesMeta)
+        _set_sqlite_busy_timeout(session)
+
+        # ============== PHASE 1: plan the import (read-only) ==============
+        # Nothing below writes, so no write lock is taken while the (possibly
+        # very large) source series is classified. The read transaction is
+        # released before the write phase begins, so a long plan does not pin
+        # an old database snapshot either.
+
+        # -- Look up StatesMeta for the destination entity --
+        # Creating it when missing is deferred to the write phase.
+        metadata_id = (
+            session.query(StatesMeta.metadata_id)
             .filter(StatesMeta.entity_id == dest_entity_id)
-            .first()
+            .scalar()
         )
-        if meta is None:
-            if dry_run:
-                # In dry run, we don't have a metadata_id if it doesn't exist.
-                # Use a dummy ID to satisfy the rest of the function logic.
-                metadata_id = -1
-            else:
-                meta = StatesMeta(entity_id=dest_entity_id)
-                session.add(meta)
-                session.flush()
-                metadata_id = meta.metadata_id
-        else:
-            metadata_id = meta.metadata_id
+        if metadata_id is None:
+            # An entity with no metadata row can have no state rows, so the
+            # classification below reads -1 as "destination has no history".
+            metadata_id = -1
 
         # -- Query the destination's oldest GOOD timestamp --
-        # This runs in the same transaction as the inserts: no TOCTOU race.
         # Non-good rows (unavailable/unknown) are excluded from the cutoff:
         # HA hides them in the History panel, so a destination whose earliest
         # rows are just unavailable markers (e.g. a ghost/restored entity that
@@ -1045,10 +1302,14 @@ def _insert_states_atomic(
         # the per-row debug_records list returned to the UI.
         if overwrite:
             # DESTRUCTIVE path: delete every destination row inside the
-            # source's span, then import the full source series. Runs in the
-            # same transaction as the inserts, so a failure rolls the deletes
-            # back too.
+            # source's span, then import the full source series. The delete
+            # happens window by window in the write phase, each window in the
+            # same transaction as the inserts that replace it, so no committed
+            # window is ever left deleted-but-not-replaced.
             to_import = list(source_states)
+            # One window per chunk, forwards, each replaced in a single
+            # transaction.
+            write_groups = [(to_import, False)]
             # The span is the source's own data range, so the blast radius is
             # exactly what the source can replace. It is reported back to the
             # UI so the user sees the window before (and after) committing.
@@ -1056,38 +1317,17 @@ def _insert_states_atomic(
             span_hi = max(s.last_updated.timestamp() for s in source_states)
             overwrite_span = (span_lo, span_hi)
 
-            doomed_ids: list[int] = []
             if metadata_id != -1:
-                doomed_ids = [
-                    row[0]
-                    for row in session.query(States.state_id)
+                overwritten = (
+                    session.query(sql_func.count(States.state_id))
                     .filter(
                         States.metadata_id == metadata_id,
                         States.last_updated_ts >= span_lo,
                         States.last_updated_ts <= span_hi,
                     )
-                    .all()
-                ]
-            overwritten = len(doomed_ids)
-
-            if doomed_ids and not dry_run:
-                # Rows OUTSIDE the deleted range can reference a deleted row
-                # through old_state_id (a self-referencing FK). Null those out
-                # first, exactly as HA's own purge does, or the DELETE fails
-                # on engines that enforce the constraint. Chunked to stay
-                # under SQLite's bound-parameter limit.
-                chunk_size = 500
-                for i in range(0, len(doomed_ids), chunk_size):
-                    chunk = doomed_ids[i : i + chunk_size]
-                    session.query(States).filter(
-                        States.old_state_id.in_(chunk)
-                    ).update({States.old_state_id: None}, synchronize_session=False)
-                for i in range(0, len(doomed_ids), chunk_size):
-                    chunk = doomed_ids[i : i + chunk_size]
-                    session.query(States).filter(
-                        States.state_id.in_(chunk)
-                    ).delete(synchronize_session=False)
-                session.flush()
+                    .scalar()
+                    or 0
+                )
 
             for s in source_states:
                 src_val = str(s.state) if s.state is not None else None
@@ -1123,6 +1363,10 @@ def _insert_states_atomic(
             )
         elif min_ts is None and not head_dedup_ts:
             to_import = list(source_states)
+            # Same resumability rule as head fill: the destination's oldest
+            # entry is the cutoff a re-run reads, so coverage has to grow
+            # backwards contiguously.
+            write_groups = [(to_import, True)]
             for s in source_states:
                 src_val = str(s.state) if s.state is not None else None
                 rec = {
@@ -1351,6 +1595,11 @@ def _insert_states_atomic(
                 debug_records.append(rec)
 
             to_import = head + mid_stream + trailing
+            write_groups = [
+                (head, True),
+                (mid_stream, False),
+                (trailing, False),
+            ]
             mid_stream_filled = len(mid_stream)
             trailing_filled = len(trailing)
 
@@ -1377,6 +1626,8 @@ def _insert_states_atomic(
         already_covered = len(source_states) - len(to_import)
 
         if not to_import or dry_run:
+            # Nothing to write (or only previewing): drop the read snapshot.
+            session.rollback()
             if dry_run:
                 inserted = len(to_import)
                 if to_import:
@@ -1397,93 +1648,177 @@ def _insert_states_atomic(
                 "cutoff_ts": min_ts,
                 "imported_min_ts": imported_min_ts,
                 "imported_max_ts": imported_max_ts,
+                "cancelled": False,
                 "debug_records": debug_records,
             }
 
-        # Ensure to_import is sorted chronologically for min/max and a stable
-        # FK-friendly insertion order (head is oldest, then mid-stream, then
-        # trailing — all already sorted within each group and disjoint).
-        imported_min_ts = to_import[0].last_updated.timestamp()
-        imported_max_ts = to_import[-1].last_updated.timestamp()
+        # to_import is chronological (head is oldest, then mid-stream, then
+        # trailing — each group already sorted and disjoint), which the
+        # chunking below relies on to carve contiguous time windows.
+
+        # ============== PHASE 2: write, in paced chunks ==============
+        # The read snapshot is dropped first: every chunk below opens its own
+        # short transaction, so the recorder gets the write lock back between
+        # chunks instead of waiting out the whole import.
+        session.rollback()
+
+        # -- Create the destination's StatesMeta row if it does not exist --
+        if metadata_id == -1:
+            meta = StatesMeta(entity_id=dest_entity_id)
+            session.add(meta)
+            session.commit()
+            metadata_id = meta.metadata_id
 
         # -- Attribute dedup cache: hash -> attributes_id --
         attrs_cache: dict[int, int] = {}
 
-        for i, state in enumerate(to_import):
-            last_updated_ts = state.last_updated.timestamp()
-
-            # -- Resolve attributes --
-            attributes_id = _get_or_create_attributes(
-                session, state.attributes, attrs_cache
+        # Chunk each group and write it in the direction that keeps an
+        # interrupted run resumable (see the note in this function's docstring).
+        ordered_chunks: list[list] = []
+        for group, newest_chunk_first in write_groups:
+            if not group:
+                continue
+            group_chunks = _chunk_states(group, _WRITE_CHUNK_ROWS)
+            ordered_chunks.extend(
+                reversed(group_chunks) if newest_chunk_first else group_chunks
             )
 
-            # -- Compute last_changed_ts --
-            # HA convention: NULL means "same as last_updated_ts" (saves space).
-            if state.last_changed == state.last_updated:
-                last_changed_ts = None
-            else:
-                last_changed_ts = state.last_changed.timestamp()
+        # Reported range covers what actually lands, which is narrower than the
+        # plan when a run is cancelled part-way.
+        imported_min_ts = imported_max_ts = None
 
-            # -- Compute last_reported_ts --
-            # NULL means "same as last_updated_ts".
-            last_reported_ts = None
-            last_reported = getattr(state, "last_reported", None)
-            if last_reported is not None and last_reported != state.last_updated:
-                last_reported_ts = last_reported.timestamp()
-
-            # -- Build the States row --
-            if state.state is None:
-                state_val = None
-            else:
-                state_val = str(state.state)
-                if transform is not None:
-                    state_val = _scale_state_value(state_val, transform)
-                state_val = state_val[:255]
-            db_state = States(
-                state=state_val,
-                metadata_id=metadata_id,
-                attributes_id=attributes_id,
-                last_changed_ts=last_changed_ts,
-                last_updated_ts=last_updated_ts,
-                last_reported_ts=last_reported_ts,
-                old_state_id=None,
-                origin_idx=0,  # local origin
-                context_id_bin=None,
-                context_user_id_bin=None,
-                context_parent_id_bin=None,
-            )
-            session.add(db_state)
-            inserted += 1
-
-            # Flush periodically to keep ORM memory bounded.
-            # This writes to the DB journal but does NOT commit — the entire
-            # batch remains in one transaction.
-            if inserted % 1000 == 0:
-                session.flush()
-                _LOGGER.debug(
-                    "Flushed %d/%d states for %s",
+        for chunk_no, chunk in enumerate(ordered_chunks, 1):
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                _LOGGER.warning(
+                    "Import into %s cancelled after %d of %d states "
+                    "(already-committed rows are kept; re-run to finish)",
+                    dest_entity_id,
                     inserted,
                     len(to_import),
-                    dest_entity_id,
+                )
+                break
+
+            if overwrite:
+                # Replace exactly this chunk's time window. The window runs
+                # from this chunk's first timestamp up to (but excluding) the
+                # next chunk's first timestamp, so the windows tile the whole
+                # source span with no overlap and no hole.
+                window_lo = chunk[0].last_updated.timestamp()
+                next_chunk = (
+                    ordered_chunks[chunk_no] if chunk_no < len(ordered_chunks) else None
+                )
+                window_hi = (
+                    next_chunk[0].last_updated.timestamp()
+                    if next_chunk is not None
+                    else overwrite_span[1]
+                )
+                _delete_states_in_window(
+                    session,
+                    metadata_id,
+                    window_lo,
+                    window_hi,
+                    inclusive_hi=next_chunk is None,
                 )
 
-        # -- SINGLE commit: all or nothing --
-        session.commit()
+            rows = []
+            for state in chunk:
+                # -- Resolve attributes --
+                attributes_id = _get_or_create_attributes(
+                    session, state.attributes, attrs_cache
+                )
+
+                # -- Compute last_changed_ts --
+                # HA convention: NULL means "same as last_updated_ts".
+                if state.last_changed == state.last_updated:
+                    last_changed_ts = None
+                else:
+                    last_changed_ts = state.last_changed.timestamp()
+
+                # -- Compute last_reported_ts --
+                # NULL means "same as last_updated_ts".
+                last_reported_ts = None
+                last_reported = getattr(state, "last_reported", None)
+                if last_reported is not None and last_reported != state.last_updated:
+                    last_reported_ts = last_reported.timestamp()
+
+                # -- Build the States row --
+                if state.state is None:
+                    state_val = None
+                else:
+                    state_val = str(state.state)
+                    if transform is not None:
+                        state_val = _scale_state_value(state_val, transform)
+                    state_val = state_val[:255]
+                rows.append(
+                    {
+                        "state": state_val,
+                        "metadata_id": metadata_id,
+                        "attributes_id": attributes_id,
+                        "last_changed_ts": last_changed_ts,
+                        "last_updated_ts": state.last_updated.timestamp(),
+                        "last_reported_ts": last_reported_ts,
+                        "old_state_id": None,
+                        "origin_idx": 0,  # local origin
+                        "context_id_bin": None,
+                        "context_user_id_bin": None,
+                        "context_parent_id_bin": None,
+                    }
+                )
+
+            # A single multi-row INSERT rather than one ORM object per state:
+            # far less time spent holding the write lock, and bounded memory
+            # on imports of hundreds of thousands of rows.
+            session.execute(States.__table__.insert(), rows)
+            session.commit()
+            inserted += len(rows)
+            if progress is not None:
+                progress["inserted"] = inserted
+
+            chunk_lo = chunk[0].last_updated.timestamp()
+            chunk_hi = chunk[-1].last_updated.timestamp()
+            imported_min_ts = (
+                chunk_lo if imported_min_ts is None else min(imported_min_ts, chunk_lo)
+            )
+            imported_max_ts = (
+                chunk_hi if imported_max_ts is None else max(imported_max_ts, chunk_hi)
+            )
+
+            _LOGGER.debug(
+                "Committed chunk %d/%d (%d/%d states) for %s",
+                chunk_no,
+                len(ordered_chunks),
+                inserted,
+                len(to_import),
+                dest_entity_id,
+            )
+
+            # Hand the write lock back so the recorder can commit its own
+            # queue before we take it again.
+            if chunk_no < len(ordered_chunks):
+                time.sleep(_WRITE_CHUNK_PAUSE_S)
+
         _LOGGER.info(
-            "Committed %d states for %s (%d source states already covered, "
-            "%d destination rows replaced)",
+            "Committed %d states for %s in %d chunk(s) (%d source states "
+            "already covered, %d destination rows replaced, cancelled=%s)",
             inserted,
             dest_entity_id,
+            len(ordered_chunks),
             already_covered,
             overwritten,
+            cancelled,
         )
 
     except Exception:
+        # Only the chunk in flight is rolled back; chunks committed before it
+        # are kept on purpose, so re-running finishes the import instead of
+        # starting over.
         session.rollback()
         _LOGGER.error(
-            "Rolling back entire import for %s — no states were written "
-            "and no rows were deleted",
+            "Import into %s failed after %d state(s) were committed — "
+            "re-run the same import to complete it",
             dest_entity_id,
+            inserted,
         )
         raise
     finally:
@@ -1503,8 +1838,80 @@ def _insert_states_atomic(
         "cutoff_ts": min_ts,
         "imported_min_ts": imported_min_ts,
         "imported_max_ts": imported_max_ts,
+        "cancelled": cancelled,
         "debug_records": debug_records,
     }
+
+
+def _chunk_states(states: list, chunk_size: int) -> list[list]:
+    """Split a chronological state list into chunks of about `chunk_size`.
+
+    A chunk never ends in the middle of a run of identical timestamps. Overwrite
+    mode derives each chunk's delete window from the next chunk's first
+    timestamp, so a boundary that splits equal timestamps would make one
+    transaction delete rows the previous one just inserted.
+    """
+    chunks: list[list] = []
+    i = 0
+    total = len(states)
+    while i < total:
+        end = min(i + chunk_size, total)
+        if end < total:
+            boundary_ts = states[end - 1].last_updated.timestamp()
+            while end < total and states[end].last_updated.timestamp() == boundary_ts:
+                end += 1
+        chunks.append(states[i:end])
+        i = end
+    return chunks
+
+
+def _delete_states_in_window(
+    session: Any,
+    metadata_id: int,
+    window_lo: float,
+    window_hi: float,
+    *,
+    inclusive_hi: bool,
+) -> None:
+    """Delete a destination entity's state rows inside one time window.
+
+    Used by overwrite mode, in the same transaction as the inserts that replace
+    the window. Rows OUTSIDE the window can still reference a deleted row
+    through `old_state_id` (a self-referencing FK), so those references are
+    nulled first, exactly as HA's own purge does, or the DELETE fails on
+    engines that enforce the constraint.
+    """
+    upper = (
+        States.last_updated_ts <= window_hi
+        if inclusive_hi
+        else States.last_updated_ts < window_hi
+    )
+    doomed_ids = [
+        row[0]
+        for row in session.query(States.state_id)
+        .filter(
+            States.metadata_id == metadata_id,
+            States.last_updated_ts >= window_lo,
+            upper,
+        )
+        .all()
+    ]
+    if not doomed_ids:
+        return
+
+    # Chunked to stay under SQLite's bound-parameter limit.
+    id_chunk = 500
+    for i in range(0, len(doomed_ids), id_chunk):
+        batch = doomed_ids[i : i + id_chunk]
+        session.query(States).filter(States.old_state_id.in_(batch)).update(
+            {States.old_state_id: None}, synchronize_session=False
+        )
+    for i in range(0, len(doomed_ids), id_chunk):
+        batch = doomed_ids[i : i + id_chunk]
+        session.query(States).filter(States.state_id.in_(batch)).delete(
+            synchronize_session=False
+        )
+    session.flush()
 
 
 def _get_or_create_attributes(
@@ -1564,8 +1971,90 @@ def _row_start_ts(row: dict) -> float:
     return start.timestamp()
 
 
+# A restarted chain shows the whole running total vanishing: the first row
+# after the drop holds one period's worth of consumption, not a lifetime total.
+# Requiring the drop to be this steep keeps a genuinely bidirectional `total`
+# sensor (whose stored sum legitimately goes down) from being mistaken for one.
+_DETACHMENT_MAX_RESIDUAL_FRACTION = 0.01
+
+
+def _find_sum_detachment(rows: list[dict]) -> dict[str, Any] | None:
+    """Find where a stored cumulative series restarted below itself.
+
+    Home Assistant seeds the running total of each compile from the sensor's
+    latest short-term row and falls back to 0.0 when there is none. A
+    destination that had history imported into it while having no chain of its
+    own therefore keeps its imported history but starts compiling its own rows
+    from zero, leaving the stored series with a single cliff: a lifetime total,
+    then a first hour's worth of consumption.
+
+    Returns the cliff as `{"start_ts", "lift", "before", "after"}` where `lift`
+    is the constant that would put the detached tail back on top of the
+    history, or None when the series has no such cliff.
+
+    Deliberately conservative, because this decides what to OFFER the user:
+    - exactly one drop in the whole series (several means something else is
+      going on and the right repair is ambiguous),
+    - the value before the drop must be positive,
+    - the value after it must be a tiny fraction of the value before, which is
+      what "restarted from zero" looks like and what an ordinary decrease in a
+      bidirectional `total` sensor does not.
+    """
+    series = sorted(
+        (
+            (_row_start_ts(r), float(r["sum"]))
+            for r in rows
+            if r.get("sum") is not None
+        ),
+        key=lambda item: item[0],
+    )
+    if len(series) < 2:
+        return None
+
+    drops = [
+        i for i in range(len(series) - 1) if series[i + 1][1] < series[i][1]
+    ]
+    if len(drops) != 1:
+        return None
+
+    i = drops[0]
+    before = series[i][1]
+    after = series[i + 1][1]
+    if before <= 0:
+        return None
+    if not (0 <= after <= before * _DETACHMENT_MAX_RESIDUAL_FRACTION):
+        return None
+
+    return {
+        "start_ts": series[i + 1][0],
+        "lift": before,
+        "before": before,
+        "after": after,
+    }
+
+
+def _detachment_notice(
+    rows: list[dict], unit: str | None
+) -> dict[str, Any] | None:
+    """Describe a restarted cumulative series for the UI, or None if it is fine."""
+    detachment = _find_sum_detachment(rows)
+    if not detachment:
+        return None
+    return {
+        "start": datetime.fromtimestamp(
+            detachment["start_ts"], tz=timezone.utc
+        ).isoformat(),
+        "lift": detachment["lift"],
+        "before": detachment["before"],
+        "after": detachment["after"],
+        "unit": unit,
+    }
+
+
 def _compute_sum_offset(
-    source_rows: list[dict], dest_rows: list[dict]
+    source_rows: list[dict],
+    dest_rows: list[dict],
+    fallback_dest_rows: list[dict] | None = None,
 ) -> float | None:
     """Compute the offset to apply to imported source `sum` values so that the
     imported series joins the destination's existing series smoothly at the
@@ -1579,10 +2068,23 @@ def _compute_sum_offset(
         (Treats any small gap as zero consumption, which is the correct
         approximation when the two sensors ran in parallel.)
 
+    `fallback_dest_rows` is consulted when the destination has no long-term row
+    with a `sum` yet. That is the case for a destination created shortly before
+    the import: HA has already compiled 5-minute rows for it (its running total
+    starting at zero) but not the first hourly row. Without the fallback no
+    splice point is found, the source series is imported at its own absolute
+    values, and the destination's live series stays anchored at zero — which is
+    what makes the meter look like it restarts from zero right after the
+    imported history.
+
     Returns None if no offset is needed (no overlap / no sum data on one side /
     offset is effectively zero).
     """
     dest_sum_rows = [r for r in dest_rows if r.get("sum") is not None]
+    if not dest_sum_rows and fallback_dest_rows:
+        dest_sum_rows = [
+            r for r in fallback_dest_rows if r.get("sum") is not None
+        ]
     if not dest_sum_rows:
         return None
 
@@ -1768,6 +2270,8 @@ async def _async_import_statistics_for_pair(
         "stats_imported_start": None,
         "stats_imported_end": None,
         "stats_sum_offset": None,
+        "stats_sum_seeded": None,
+        "stats_detached": None,
         "stats_unit": None,
         "debug_stats": [],
     }
@@ -1797,14 +2301,56 @@ async def _async_import_statistics_for_pair(
     source_rows = source_stats_raw.get(source_id, [])
     dest_rows = dest_stats_raw.get(dest_id, [])
 
+    # -- Look at the destination's own statistics --
+    # Three things, all about how HA will continue the destination's running
+    # total after this import:
+    #
+    #  - Does it have a 5-minute row carrying a sum? A destination created
+    #    shortly before the import has no hourly row yet, so there would be no
+    #    splice point and the imported series would be written at its own
+    #    absolute values while the destination's live total stays anchored at
+    #    zero. Its 5-minute rows provide the splice point instead. Only asked
+    #    when there is no hourly row to splice against.
+    #  - Does it have ANY 5-minute row? If not, HA has no chain to continue and
+    #    seeds every compile at 0.0, so the running total has to be seeded (see
+    #    further below). This is independent of whether the destination has
+    #    hourly rows: a destination that was imported into before, but has
+    #    never compiled statistics of its own, has hourly rows and no chain.
+    #  - Does its stored hourly series already restart from zero partway
+    #    through? That is damage an earlier import left behind, which this run
+    #    can only report and offer to repair.
+    dest_has_hourly_sum = any(r.get("sum") is not None for r in dest_rows)
+    dest_anchor = await recorder.async_add_executor_job(
+        partial(
+            _fetch_dest_sum_anchor,
+            recorder,
+            dest_id,
+            want_earliest_sum=not dest_has_hourly_sum,
+            want_hourly=True,
+        )
+    )
+    # Read straight off the stored column, so the reported amount is in the
+    # unit the repair will actually add.
+    out["stats_detached"] = _detachment_notice(
+        dest_anchor["hourly"], dest_anchor["unit"]
+    )
+
     out["stats_source_total"] = len(source_rows)
     if not source_rows:
+        # Nothing left to import from this source, but the destination may
+        # still be carrying a restart-from-zero from an earlier import, and
+        # repairing that does not need the source at all.
         return out
 
     # -- Apply the unit scaling factor BEFORE any splice math --
     # The sum offset and column merges below must operate in the destination's
     # value space, so the source rows are converted first.
     source_rows = _scale_stat_rows(source_rows, transform)
+
+    source_has_sum_values = any(r.get("sum") is not None for r in source_rows)
+    anchor_rows: list[dict] = (
+        [dest_anchor["earliest_sum"]] if dest_anchor["earliest_sum"] else []
+    )
 
     # -- Compute sum offset (None if not applicable) --
     # In overwrite mode the destination rows the source is about to replace no
@@ -1822,7 +2368,7 @@ async def _async_import_statistics_for_pair(
         ]
     else:
         surviving_dest_rows = dest_rows
-    sum_offset = _compute_sum_offset(source_rows, surviving_dest_rows)
+    sum_offset = _compute_sum_offset(source_rows, surviving_dest_rows, anchor_rows)
 
     # -- Build destination row lookup by start_ts --
     # IMPORTANT: a row existing at a given hour does NOT mean it's "covered".
@@ -1919,12 +2465,9 @@ async def _async_import_statistics_for_pair(
     out["stats_overwritten"] = overwritten
     out["debug_stats"] = debug_stats
 
-    if not to_import_rows:
-        if sum_offset is not None:
-            out["stats_sum_offset"] = sum_offset
-        return out
-
     # -- Resolve metadata: prefer destination's existing metadata --
+    # Resolved before the "nothing to import" exit below, because the running
+    # total may still need seeding on a run that imports no new hourly row.
     has_sum = any(r.get("sum") is not None for r in source_rows)
     has_mean = any(r.get("mean") is not None for r in source_rows)
 
@@ -1966,6 +2509,42 @@ async def _async_import_statistics_for_pair(
 
     out["stats_unit"] = unit
     _ensure_unit_class(metadata)
+
+    # --- Seed the destination's running total when it has no chain to continue ---
+    # HA seeds `_sum` for every compile from the destination's latest short-term
+    # row and uses 0.0 when there is none (sensor/recorder.py). A destination
+    # with no short-term row at all — a helper or meter created for this import
+    # — would therefore start its own series at zero right after the history we
+    # just imported, which reads as "the meter restarted from zero".
+    #
+    # The seed value is the running total at the newest point the destination's
+    # history reaches once this import lands, counting both the rows being
+    # imported and the rows already there.
+    #
+    # Only planned here; it is queued (and the "no chain" check repeated
+    # against a fresh reading) in _do_import, since HA may compile the
+    # destination's first 5-minute row while the rest of this import runs.
+    if source_has_sum_values and not dest_anchor["has_rows"]:
+        merged_sums: dict[float, float] = {
+            _row_start_ts(r): float(r["sum"])
+            for r in dest_rows
+            if r.get("sum") is not None
+        }
+        # Imported values win at any hour they cover.
+        merged_sums.update(
+            {ts: float(data["sum"]) for ts, data in to_import_rows if "sum" in data}
+        )
+        if merged_sums:
+            out["_sum_seed"] = {
+                "sum": merged_sums[max(merged_sums)],
+                "metadata": dict(metadata),
+            }
+            out["stats_sum_seeded"] = merged_sums[max(merged_sums)]
+
+    if not to_import_rows:
+        if sum_offset is not None:
+            out["stats_sum_offset"] = sum_offset
+        return out
 
     # -- Build StatisticData entries --
     # data dicts already have sum_offset applied (during merge/partition) and
@@ -2032,6 +2611,12 @@ async def _async_import_statistics_for_pair(
             for r in surviving_dest_rows
             if r.get("sum") is not None
         ]
+        if not dest_sum_ts and anchor_rows:
+            # The join point came from the destination's 5-minute rows. The lift
+            # reaches those too: adjust_statistics updates both the short-term
+            # and the long-term table, so the destination's next compile re-seeds
+            # its running total from a lifted row and the series stays continuous.
+            dest_sum_ts = [_row_start_ts(anchor_rows[0])]
         imported_sum_ts = [ts for ts, data in to_import_rows if "sum" in data]
         if (
             dest_sum_ts
@@ -2063,6 +2648,186 @@ async def _async_import_statistics_for_pair(
         sum_offset,
     )
     return out
+
+
+def _fetch_dest_sum_anchor(
+    recorder_instance: Any,
+    statistic_id: str,
+    want_earliest_sum: bool = True,
+    want_hourly: bool = False,
+) -> dict[str, Any]:
+    """Look at a destination's short-term (5-minute) statistics for splicing.
+
+    Returns `has_rows` (does the destination have ANY short-term row?) and
+    `earliest_sum` (the oldest row carrying a non-NULL `sum`, as a
+    `{"start", "sum"}` dict, or None).
+
+    Both matter for cumulative sensors, because HA seeds the running total of
+    every new compile from the destination's LATEST short-term row
+    (sensor/recorder.py: `_sum = last_stat.get("sum") or 0.0`) and falls back
+    to 0.0 when there is no such row:
+
+      - `earliest_sum` gives a splice point when the destination is too young
+        to have an hourly row yet, so the imported series can be offset onto
+        the destination's own series (and then lifted as a whole by the
+        realignment step).
+      - `has_rows` False means the destination has no compile chain at all, so
+        a seed row has to be written for the running total to continue from the
+        end of the imported history instead of from zero.
+
+    Only the two rows we need are queried, not the destination's whole
+    short-term history (up to ~2900 rows per day).
+    """
+    session = recorder_instance.get_session()
+    try:
+        metadata_id = (
+            session.query(StatisticsMeta.id)
+            .filter(StatisticsMeta.statistic_id == statistic_id)
+            .scalar()
+        )
+        if metadata_id is None:
+            return {
+                "has_rows": False,
+                "earliest_sum": None,
+                "hourly": [],
+                "unit": None,
+            }
+
+        has_rows = (
+            session.query(StatisticsShortTerm.id)
+            .filter(StatisticsShortTerm.metadata_id == metadata_id)
+            .first()
+            is not None
+        )
+        earliest = (
+            session.query(
+                StatisticsShortTerm.start_ts, StatisticsShortTerm.sum
+            )
+            .filter(
+                StatisticsShortTerm.metadata_id == metadata_id,
+                StatisticsShortTerm.sum.isnot(None),
+            )
+            .order_by(StatisticsShortTerm.start_ts.asc())
+            .first()
+            if want_earliest_sum
+            else None
+        )
+        earliest_sum = (
+            {"start": earliest[0], "sum": earliest[1]}
+            if earliest is not None
+            else None
+        )
+
+        # The hourly series is read RAW, straight off the column. Going through
+        # statistics_during_period would convert it to the entity's display
+        # unit, and a lift measured there cannot be applied to the stored
+        # column without converting it back.
+        hourly: list[dict] = []
+        unit: str | None = None
+        if want_hourly:
+            unit = (
+                session.query(StatisticsMeta.unit_of_measurement)
+                .filter(StatisticsMeta.statistic_id == statistic_id)
+                .scalar()
+            )
+            hourly = [
+                {"start": row[0], "sum": row[1]}
+                for row in session.query(Statistics.start_ts, Statistics.sum)
+                .filter(
+                    Statistics.metadata_id == metadata_id,
+                    Statistics.sum.isnot(None),
+                )
+                .order_by(Statistics.start_ts.asc())
+                .all()
+            ]
+
+        return {
+            "has_rows": has_rows,
+            "earliest_sum": earliest_sum,
+            "hourly": hourly,
+            "unit": unit,
+        }
+    finally:
+        session.close()
+
+
+def _repair_sum_series(
+    recorder_instance: Any, statistic_id: str
+) -> dict[str, Any]:
+    """Lift a restarted cumulative series back on top of its own history.
+
+    Detection and the lift happen in one transaction against the stored
+    columns, which is what makes the repair safe to trigger twice:
+
+    - Reading raw keeps the lift in the unit the column is stored in.
+      `statistics_during_period` converts to the entity's display unit, which
+      is not necessarily the same, and HA's `adjust_statistics` only converts
+      when told which display unit the adjustment is expressed in.
+    - `async_adjust_statistics` merely queues a task on the recorder thread,
+      so a second click (or a re-run of the import) could read a database that
+      did not yet reflect the first one and queue the same lift again. Doing
+      the update here means that once this returns, the cliff really is gone
+      and any later detection sees that.
+
+    Returns `{"repaired": bool, ...}` describing what happened.
+    """
+    session = recorder_instance.get_session()
+    try:
+        _set_sqlite_busy_timeout(session)
+
+        meta_row = (
+            session.query(StatisticsMeta.id, StatisticsMeta.unit_of_measurement)
+            .filter(StatisticsMeta.statistic_id == statistic_id)
+            .first()
+        )
+        if meta_row is None:
+            return {
+                "repaired": False,
+                "reason": f"{statistic_id} has no statistics to repair.",
+            }
+        metadata_id, unit = meta_row[0], meta_row[1]
+
+        rows = [
+            {"start": row[0], "sum": row[1]}
+            for row in session.query(Statistics.start_ts, Statistics.sum)
+            .filter(
+                Statistics.metadata_id == metadata_id,
+                Statistics.sum.isnot(None),
+            )
+            .order_by(Statistics.start_ts.asc())
+            .all()
+        ]
+        detachment = _find_sum_detachment(rows)
+        if not detachment:
+            return {
+                "repaired": False,
+                "reason": (
+                    f"{statistic_id} no longer has a restarted running total. "
+                    "Nothing to repair."
+                ),
+            }
+
+        lift = float(detachment["lift"])
+        start_ts = float(detachment["start_ts"])
+        for table in (Statistics, StatisticsShortTerm):
+            session.query(table).filter(
+                table.metadata_id == metadata_id,
+                table.start_ts >= start_ts,
+                table.sum.isnot(None),
+            ).update({table.sum: table.sum + lift}, synchronize_session=False)
+        session.commit()
+
+        return {
+            "repaired": True,
+            "lift": lift,
+            "start_ts": start_ts,
+            "unit": unit,
+        }
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
 def _fetch_stats_snapshot(

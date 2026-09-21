@@ -392,6 +392,34 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           margin-top: 2px;
           padding-top: 2px;
         }
+        .repair-notice {
+          grid-column: 1/-1;
+          margin-top: 6px;
+          padding: 10px 12px;
+          border-radius: 6px;
+          border: 1px solid var(--warning-color, #ff9800);
+          background: rgba(255, 152, 0, 0.08);
+          font-size: 13px;
+          line-height: 1.45;
+        }
+        .repair-btn {
+          margin-top: 8px;
+          padding: 6px 12px;
+          border-radius: 4px;
+          border: 1px solid var(--warning-color, #ff9800);
+          background: var(--warning-color, #ff9800);
+          color: #fff;
+          font-size: 13px;
+          cursor: pointer;
+        }
+        .repair-btn:disabled {
+          opacity: 0.6;
+          cursor: default;
+        }
+        .repair-outcome {
+          margin-top: 8px;
+          font-size: 13px;
+        }
         .debug-dl-btn {
           background: transparent;
           border: 1px solid color-mix(in srgb, var(--primary-color, #03a9f4) 50%, transparent);
@@ -962,6 +990,11 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     });
 
     this._resultsContainer.addEventListener("click", (ev) => {
+      const repairBtn = ev.target.closest(".repair-btn");
+      if (repairBtn) {
+        this._repairSumSeries(repairBtn);
+        return;
+      }
       const btn = ev.target.closest(".debug-dl-btn");
       if (!btn) return;
       this._downloadDebug(btn.dataset.pair, btn.dataset.kind);
@@ -1588,6 +1621,63 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     }
   }
 
+  /** Explain a destination whose running total restarted from zero, and offer
+   *  the repair. Returns "" when the series is fine. */
+  _repairNotice(r) {
+    const d = r.stats_detached;
+    if (!d) return "";
+    const liftStr = this._esc(this._formatOffset(d.lift, d.unit || r.stats_unit));
+    const when = this._esc(this._formatTs(d.start));
+    const dest = this._esc(r.destination);
+    return `<div class="repair-notice">
+      <strong>This destination's stored running total restarted from zero on ${when}.</strong><br/>
+      Home Assistant continues a sensor's running total from that sensor's own most recent
+      5-minute statistics row, and starts again from zero when there is none. At some point
+      this destination had no statistics of its own to continue from, so everything it has
+      recorded since ${when} counts up from zero instead of carrying on from the history
+      before it. The history itself is intact; the two halves are simply on different
+      baselines, which is what makes the Energy dashboard show a drop there.<br/>
+      Repairing adds <strong>${liftStr}</strong> to every statistics row from ${when} onwards,
+      so the two halves line up and future readings continue from the corrected total. Rows before
+      ${when} are left alone, and per-hour and per-day figures do not change: only the running
+      total moves.
+      <br/>
+      ${
+        r.dry_run
+          ? `<em>Run the import to get the option to repair this. A preview never writes anything.</em>`
+          : `<button class="repair-btn" data-statistic-id="${dest}">Repair running total</button>
+             <div class="repair-outcome"></div>`
+      }
+    </div>`;
+  }
+
+  async _repairSumSeries(btn) {
+    const statisticId = btn.dataset.statisticId;
+    const outcome = btn.parentElement.querySelector(".repair-outcome");
+    btn.disabled = true;
+    btn.textContent = "Repairing…";
+    try {
+      const res = await this._hass.callWS({
+        type: "merge_sensor_history/repair_sum_series",
+        statistic_id: statisticId,
+      });
+      if (res.repaired) {
+        const liftStr = this._esc(this._formatOffset(res.lift, res.unit));
+        const when = this._esc(this._formatTs(res.start));
+        outcome.innerHTML = `✅ Running total repaired: every row from ${when} onwards was lifted by <strong>${liftStr}</strong>. The Energy dashboard may take a few minutes to catch up.`;
+        btn.remove();
+      } else {
+        outcome.textContent = res.reason || "Nothing to repair.";
+        btn.disabled = false;
+        btn.textContent = "Repair running total";
+      }
+    } catch (err) {
+      outcome.textContent = `Repair failed: ${err.message || err}`;
+      btn.disabled = false;
+      btn.textContent = "Repair running total";
+    }
+  }
+
   _downloadDebug(pairKey, kind) {
     const pair = this._debugByPair.get(pairKey);
     if (!pair) return;
@@ -1672,6 +1762,19 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         const pairKey = `${i}`;
 
         if (r.error) {
+          const written = r.states_imported || 0;
+          // A destination can still be carrying a restart-from-zero even when
+          // this pair failed (a source whose statistics are long gone, for
+          // one), and repairing that does not depend on the source.
+          const repairBlock = this._repairNotice(r);
+          // Writes are committed in batches, so an import that stops part-way
+          // keeps the batches that already landed. Saying "nothing was written"
+          // would send people looking for a rollback that never happened.
+          const aftermath = r.dry_run
+            ? "This was a preview only, so nothing was written."
+            : written > 0
+              ? `${written.toLocaleString()} state(s) were already written and have been kept. Re-run the same import to continue from there.`
+              : "Nothing was written. Re-run the import once the cause is resolved.";
           return `<div class="result-item result-error">
             <div class="result-header">
               <span class="result-icon">&#10060;</span>
@@ -1679,7 +1782,8 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             </div>
             <div class="result-details">
               ${r.error}<br/>
-              <em>No data was written &mdash; ${r.dry_run ? "this was a preview only." : "the import was rolled back."}</em>
+              <em>${aftermath}</em>
+              ${repairBlock}
             </div>
           </div>`;
         }
@@ -1799,6 +1903,15 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             grid += `<span class="result-stat-range" style="grid-column:1/-1">Cumulative-sum offset ${r.dry_run ? "would be applied" : "applied"}: <strong>${offsetStr}</strong> (aligns energy totals at splice point)</span>`;
             grid += `<span class="result-stat-range" style="grid-column:1/-1">The oldest imported hour absorbs this offset, so it can show a one-off value in the Energy dashboard's all-time total. Your hourly/daily usage graph is unaffected; correct that single hour under Developer Tools → Statistics if you want a perfect lifetime total.</span>`;
           }
+          if (r.stats_sum_seeded !== null && r.stats_sum_seeded !== undefined) {
+            const seedStr = this._formatOffset(r.stats_sum_seeded, r.stats_unit);
+            grid += r.dry_run
+              ? `<span class="result-stat-range" style="grid-column:1/-1">The destination has no statistics of its own yet, so its running total would be seeded at <strong>${seedStr}</strong>, where its history currently ends. Without that, the statistics Home Assistant compiles from now on would restart at zero.</span>`
+              : `<span class="result-stat-range" style="grid-column:1/-1">The destination had no statistics of its own yet, so its running total was seeded at <strong>${seedStr}</strong>, where its history currently ends. The statistics Home Assistant compiles from now on continue from there instead of restarting at zero.</span>`;
+          }
+          if (r.stats_seed_error)
+            grid += `<span class="result-stat-error">Could not seed the running total: ${r.stats_seed_error}</span>`;
+          grid += this._repairNotice(r);
           if (r.stats_realign_error)
             grid += `<span class="result-stat-error">Realignment failed: ${r.stats_realign_error}</span>`;
           if (r.stats_error)

@@ -8,8 +8,8 @@ Built for migrating sensor data between integrations — for example, when repla
 
 - **Sidebar panel** with a simple UI: select source/destination pairs, click Import
 - **Imports both states and long-term statistics** (hourly aggregates for energy dashboard / long-term graphs)
-- **Atomic transactions**: either all states are imported or none are — no partial imports that leave gaps
-- **Idempotent**: safe to re-run; a successful import shifts the cutoff so nothing is re-imported, and a failed import is fully rolled back
+- **Never blocks the recorder**: writes are committed in small paced batches, so Home Assistant keeps recording normally throughout even a very large import
+- **Idempotent and resumable**: safe to re-run; a successful import shifts the cutoff so nothing is re-imported, and an import interrupted part-way keeps what it wrote so re-running finishes the job
 - **Optional overwrite mode** for destinations holding known-bad data (opt-in, destructive, clearly warned)
 - **Entity filter** to quickly find sensors by keyword
 - **Also available as a service** (`merge_sensor_history.import_history`) for use in automations or Developer Tools
@@ -18,10 +18,10 @@ Built for migrating sensor data between integrations — for example, when repla
 ## How it works
 
 1. Reads **all** historical states from the source entity via the recorder API
-2. Queries the destination entity's **oldest good entry** (inside the same DB transaction). Hidden `unavailable`/`unknown` rows are not counted as coverage: a destination whose earliest rows are just unavailable markers (common when the entity id existed before, e.g. as a ghost of a removed integration) has no visible history there
+2. Queries the destination entity's **oldest good entry**. Hidden `unavailable`/`unknown` rows are not counted as coverage: a destination whose earliest rows are just unavailable markers (common when the entity id existed before, e.g. as a ghost of a removed integration) has no visible history there
 3. Imports only source states that are **strictly older** than that oldest good entry, skipping any exact-timestamp duplicates. This prevents overlap or duplication
 4. Imports **long-term statistics** (hourly mean/min/max/sum) via the official `async_import_statistics` API, which is inherently deduplicated by the database schema
-5. Commits everything in a **single transaction** — if anything fails, the entire import is rolled back and you can safely retry
+5. Writes in **small batches, committing each one and pausing in between**, so the recorder always gets its database back and keeps recording. Batches are ordered so that if an import is interrupted, re-running it simply continues from where it stopped
 
 ### What gets imported
 
@@ -106,6 +106,8 @@ data:
 - The import is a **one-time operation**, not a continuous sync. Run it once after setting up your new sensors.
 - **Cost is a separate sensor from energy.** Pair the cost sensors too if you want their history (see the note under [Usage](#sidebar-panel)) — migrating only the energy sensor leaves past cost at `0`.
 - **Energy sensors are stitched into one continuous series automatically.** When you import older energy history in front of a destination that *already has* statistics, the two cumulative `sum` series (old and new) start from different baselines. The integration lifts the destination's running total, its existing and future statistics, by a constant so the imported history and the existing data join seamlessly, using Home Assistant's own statistics-adjustment mechanism. The result is correct hourly, daily and lifetime energy totals, with no spike and no manual first-hour correction. Per-hour and per-day consumption values are unchanged by the lift (it is a constant offset), and the lift is preserved across restarts (Home Assistant re-reads it from the database). The import stays safe to re-run: a second run detects the series is already aligned and does nothing.
+- **A brand-new destination keeps counting from the imported history.** Home Assistant continues a sensor's running total from the sensor's own most recent 5-minute statistics row, and starts again from zero when there is none. A destination that has never compiled statistics of its own, such as a helper or meter created for the import, would therefore restart at zero right after the imported history: the history would be there, but the meter would look like it reset. The import seeds the destination's running total at the end of the imported history so the new readings continue from it, and the import summary reports the value it seeded.
+- **A destination that already restarted from zero can be repaired from the panel.** If an earlier import left the destination with its history intact but its own later rows counting up from zero, the import result says so and offers a **Repair running total** button. It lifts every statistics row from the restart point onwards by the total the series had reached, using Home Assistant's own statistics-adjustment mechanism, so the two halves line up and future readings continue from the corrected total. Rows before the restart point are untouched and per-hour and per-day figures do not change. Nothing is repaired unless you click it, and the offer only appears when the series shows a single unambiguous restart (a sensor whose total legitimately goes down, such as a bidirectional one, is not flagged).
 - **Spikes that reappear after a restart are a separate sensor issue, not this integration.** Some energy sensors (solar inverters especially) briefly report `0` while Home Assistant restarts, for example during a HAOS or core update. Home Assistant then counts the jump from `0` back up to the real reading as an hour of consumption, which shows as a spike. This happens on every restart, with or without this integration, and no statistics adjustment can prevent it (the realignment above neither causes nor fixes it). The durable fix is at the source: make the sensor report `unavailable` (which Home Assistant ignores) instead of `0` during restarts, usually with a template sensor that has an `availability` condition, then point the Energy dashboard at that clean sensor. See the community write-ups on [energy dashboard spikes](https://community.home-assistant.io/t/data-spikes-in-the-energy-dashboard/469843).
 
 ## Requirements
