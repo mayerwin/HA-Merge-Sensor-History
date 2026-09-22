@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import bisect
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -58,8 +59,13 @@ from homeassistant.components.recorder.db_schema import (
     StatisticsMeta,
     StatisticsShortTerm,
 )
+try:
+    from homeassistant.components.recorder.tasks import RecorderTask
+except ImportError:  # pragma: no cover - older/newer HA without this module
+    RecorderTask = None  # type: ignore[assignment,misc]
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.helpers import config_validation as cv
 
 from .const import DOMAIN
@@ -74,62 +80,41 @@ _EPOCH = datetime(2000, 1, 1, tzinfo=timezone.utc)
 _NON_GOOD_STATES = frozenset({"unavailable", "unknown"})
 
 # --- Write strategy ---------------------------------------------------------
-# An import is written in ONE transaction whenever that is possible, so it is
-# all-or-nothing. Only SQLite constrains that, and only for very large imports.
+# The whole import is written in ONE transaction: either all of it lands or
+# none of it does. Nothing here trades that away for throughput.
 #
-# SQLite allows a single writer at a time, and the recorder commits its own
-# event queue roughly once a second on a DIFFERENT connection than the one this
-# integration writes through (HA's RecorderPool hands every worker thread its
-# own connection). So on SQLite a write transaction we hold makes the recorder
-# wait. That is fine up to a point: the recorder's connection waits out a busy
-# database for the driver default of 5 seconds before giving up, and its queue
-# absorbs a pause of that order without anyone noticing.
+# The reason an earlier version had to think about this at all is SQLite, which
+# allows a single writer. The recorder commits its own event queue about once a
+# second, and if it is writing through a DIFFERENT connection than we are, our
+# transaction locks it out. It does not give up quickly (it retries
+# `db_max_retries`, 10 by default, waiting `db_retry_wait`, 3s, between
+# attempts that each wait out the driver's 5s busy timeout, so roughly 80
+# seconds of patience), but once it does give up, `_reopen_event_session`
+# rolls its pending events back and those events are gone. That is the data
+# loss behind issue #15, where an import written one ORM row at a time held the
+# lock far longer than that.
 #
-# What is NOT fine is holding the lock for longer than that, which is what an
-# earlier version did by inserting one ORM object per state: the recorder hit
-# "database is locked" every few seconds, its queue grew without bound, and a
-# Home Assistant restart, which drops that queue and loses history, was the
-# only way out. Writing rows with a single multi-row INSERT instead made the
-# same work roughly an order of magnitude faster, which is what brings the
-# ordinary import comfortably back inside the recorder's tolerance.
+# The fix is not to give up atomicity, it is to stop competing for the lock.
+# The import runs as a task on the RECORDER'S OWN THREAD, through the same
+# queue and the same connection the recorder uses for everything else, exactly
+# as Home Assistant's own bulk `ImportStatisticsTask` does. There is then no
+# second writer, so "database is locked" cannot happen no matter how long the
+# write takes. Events simply queue while the task runs and drain afterwards,
+# which is ordinary recorder behaviour: the backlog only becomes a problem past
+# 65,000 queued events AND less than 256MB of free memory, and an import
+# bounded by the recorder's ~10 day state retention does not come close.
 #
-# So on SQLite the import measures itself as it goes and gives up on atomicity
-# only when it can see it will not make the budget, rolling back (nothing has
-# been committed at that point) and rewriting in paced chunks instead. On
-# engines with row-level locking and MVCC, Postgres and MariaDB/MySQL, a long
-# write transaction does not block the recorder at all, so they always get the
-# single transaction.
+# Rows still go in with a multi-row INSERT rather than one ORM object each,
+# which is roughly an order of magnitude faster and keeps that queueing window
+# short: about 1 second per 100k states, so a large import measured in the
+# hundreds of thousands costs a few seconds of queued events.
 #
-# How long one transaction may hold SQLite's write lock. Well inside the 5s the
-# recorder waits, leaving room for a slower disk than the one this was measured
-# on. For reference, on an SSD a single transaction holds the lock for about
-# 0.6s per 100k states.
-_ATOMIC_BUDGET_S = 2.0
-# Rows per progress check while trying the single transaction. Also the most
-# work thrown away when the attempt is abandoned.
-_ATOMIC_PROBE_ROWS = 5000
-# Fallback path only: rows per committed chunk. Large enough that
-# per-transaction overhead and the pause below stay a small share of the total,
-# small enough that a chunk holds the write lock for a fraction of a second.
-_WRITE_CHUNK_ROWS = 10_000
-# Fallback path only: pause after each committed chunk so the recorder's
-# pending commit can take the write lock instead of spinning on it. The
-# recorder commits about once a second, so this only has to be long enough for
-# a waiting commit to get in.
-_WRITE_CHUNK_PAUSE_S = 0.02
-# Wait this long for the write lock rather than failing instantly when the
-# recorder happens to hold it (the driver default is 5s, which a busy recorder
-# can exceed while flushing a large batch).
-_SQLITE_BUSY_TIMEOUT_MS = 30_000
-
-
-def _is_sqlite(session: Any) -> bool:
-    """Is this session talking to SQLite, the one engine with a single writer?"""
-    try:
-        bind = session.get_bind()
-        return bind is not None and bind.dialect.name == "sqlite"
-    except Exception:  # pragma: no cover - treated as the constrained case
-        return True
+# Rows per INSERT. Purely a memory/round-trip trade-off within the one
+# transaction, and also how often cancellation is checked.
+_WRITE_BATCH_ROWS = 10_000
+# Only used on the fallback path below, where we are not on the recorder
+# thread and therefore do compete for the lock. Waiting beats failing fast.
+_SQLITE_BUSY_TIMEOUT_MS = 120_000
 
 
 def _set_sqlite_busy_timeout(session: Any) -> None:
@@ -400,10 +385,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Merge Sensor History from a config entry."""
     domain_data = hass.data.setdefault(DOMAIN, {})
     domain_data.setdefault("_locks", {})
-    # Cancel events for imports currently writing to the database, so unloading
-    # (or reloading) the integration stops them instead of leaving a long
-    # transaction running with no way to reach it.
-    domain_data.setdefault("_cancel_events", set())
+    # Cancel events for imports currently writing to the database. Without
+    # these there is no way to reach a running import at all: unloading or
+    # reloading a config entry does not stop work already handed to the
+    # recorder, so an import that outlived the user's patience could only be
+    # stopped by restarting Home Assistant. They are set on unload and on
+    # shutdown, and the writer checks between batches.
+    cancel_events: set[threading.Event] = domain_data.setdefault(
+        "_cancel_events", set()
+    )
+
+    if not domain_data.get("_stop_listener_registered"):
+
+        @callback
+        def _cancel_on_stop(_event: Any) -> None:
+            """Stop any running import so shutdown is not held up by it."""
+            for cancel_event in list(cancel_events):
+                cancel_event.set()
+
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _cancel_on_stop)
+        domain_data["_stop_listener_registered"] = True
 
     # Register the static asset path + sidebar panel. If either step fails we
     # let the exception propagate so the config entry fails to set up — HA shows
@@ -758,7 +759,6 @@ async def _async_import_pair(
         "states_source_missing": False,  # True: source had no raw states (stats-only)
         "states_source_skipped_non_good": 0,  # unavailable/unknown source rows
         "states_imported": 0,
-        "states_atomic": True,  # False: written in batches, so partially resumable
         "states_already_covered": 0,
         "states_mid_stream_filled": 0,  # source states imported inside dest-range gaps
         "states_trailing_filled": 0,  # source states imported after dest's newest
@@ -911,39 +911,24 @@ async def _do_import(
             source_states[-1].last_updated.isoformat(),
         )
 
-        # --- 2. Insert states, committing in paced chunks ---
-        # A single transaction for the whole import would hold SQLite's only
-        # write lock for its entire duration and lock the recorder out of its
-        # own database, so the writer commits in bounded chunks and pauses
-        # between them. Chunks are ordered so an interrupted run is resumable.
-        # In overwrite mode each chunk also deletes the destination rows it
-        # replaces, in the same transaction as its inserts.
-        # Committed rows are kept when the writer raises part-way, so the
-        # count has to survive the exception for the UI to report it.
-        states_progress: dict[str, int] = {"inserted": 0}
-        try:
-            states_out = await recorder.async_add_executor_job(
-                partial(
-                    _insert_states_chunked,
-                    recorder,
-                    dest_id,
-                    source_states,
-                    fill_gaps=fill_gaps,
-                    gap_threshold_minutes=gap_threshold_minutes,
-                    dry_run=dry_run,
-                    transform=transform,
-                    overwrite=overwrite,
-                    cancel_event=cancel_event,
-                    progress=states_progress,
-                )
-            )
-        except Exception:
-            # Zero unless the batched fallback had already committed some.
-            result["states_imported"] = states_progress["inserted"]
-            result["states_atomic"] = states_progress["inserted"] == 0
-            raise
+        # --- 2. Insert states in a single transaction ---
+        # All-or-nothing, at any size. It runs on the recorder's own thread so
+        # it shares the recorder's connection and never competes with it for
+        # SQLite's write lock. The destination's cutoff is read inside the same
+        # transaction as the insert, so there is no TOCTOU race, and in
+        # overwrite mode the rows being replaced are deleted in it too.
+        states_out = await _async_write_states(
+            recorder,
+            cancel_event,
+            dest_entity_id=dest_id,
+            source_states=source_states,
+            fill_gaps=fill_gaps,
+            gap_threshold_minutes=gap_threshold_minutes,
+            dry_run=dry_run,
+            transform=transform,
+            overwrite=overwrite,
+        )
         result["states_imported"] = states_out["inserted"]
-        result["states_atomic"] = states_out.get("atomic", True)
         result["states_already_covered"] = states_out["already_covered"]
         result["states_mid_stream_filled"] = states_out["mid_stream_filled"]
         result["states_trailing_filled"] = states_out["trailing_filled"]
@@ -973,19 +958,13 @@ async def _do_import(
             ).isoformat()
 
         if states_out.get("cancelled"):
-            # The integration was unloaded or reloaded mid-import. A cancelled
-            # single transaction rolled back and wrote nothing; a cancelled
-            # batched run keeps what it committed. Either way the statistics
-            # steps are skipped and re-running completes the job.
-            written = result["states_imported"]
+            # Home Assistant is shutting down, or the integration was
+            # reloaded or disabled mid-import. The transaction rolled back, so
+            # the database is untouched and the statistics steps are skipped.
             result["error"] = (
-                f"Import into {dest_id} was cancelled before it finished. "
-                + (
-                    f"{written:,} state(s) were written and have been kept. "
-                    if written
-                    else "Nothing was written. "
-                )
-                + "Re-run the same import to complete it."
+                f"Import into {dest_id} was cancelled before it finished, so "
+                "nothing was written and the database is unchanged. Run the "
+                "same import again when you are ready."
             )
             return
 
@@ -1185,7 +1164,87 @@ async def _do_import(
         )
 
 
-def _insert_states_chunked(
+async def _async_write_states(
+    recorder: Any, cancel_event: threading.Event, **kwargs: Any
+) -> dict[str, Any]:
+    """Run the state write and wait for it, preferring the recorder's thread.
+
+    Going through the recorder's own task queue means the write shares the
+    recorder's connection, so it cannot compete with the recorder for SQLite's
+    single write lock however long it takes. That is what lets the import stay
+    in one transaction at any size. Home Assistant's own bulk statistics
+    import uses the same queue.
+
+    If that queue is not available (a Home Assistant version that moved
+    `RecorderTask`), the write falls back to a database worker thread. It is
+    still one transaction, but it then does compete for the lock, so the
+    connection is told to wait rather than fail.
+    """
+    if RecorderTask is None:  # pragma: no cover - depends on the HA version
+        _LOGGER.debug(
+            "Recorder task queue unavailable; writing states from a worker "
+            "thread instead"
+        )
+        return await recorder.async_add_executor_job(
+            partial(
+                _insert_states,
+                recorder,
+                set_busy_timeout=True,
+                cancel_event=cancel_event,
+                **kwargs,
+            )
+        )
+
+    future: concurrent.futures.Future = concurrent.futures.Future()
+    recorder.queue_task(
+        _ImportStatesTask(future, cancel_event, kwargs)
+    )
+    return await asyncio.wrap_future(future)
+
+
+class _ImportStatesTask(RecorderTask if RecorderTask is not None else object):  # type: ignore[misc]
+    """Write the states on the recorder's own thread.
+
+    `commit_before` (inherited, True) makes the recorder flush its pending
+    events before this runs, so the connection this shares with it starts
+    clean.
+    """
+
+    # Not a dataclass: HA's RecorderTask subclasses are, but slots plus a
+    # plain __init__ keeps this working whichever way the base class is
+    # declared in the installed version.
+    __slots__ = ("_future", "_cancel_event", "_kwargs")
+
+    def __init__(
+        self,
+        future: concurrent.futures.Future,
+        cancel_event: threading.Event,
+        kwargs: dict[str, Any],
+    ) -> None:
+        self._future = future
+        self._cancel_event = cancel_event
+        self._kwargs = kwargs
+
+    def run(self, instance: Any) -> None:
+        """Do the import, handing the result (or the error) back to the caller."""
+        if self._future.set_running_or_notify_cancel() is False:
+            return
+        try:
+            self._future.set_result(
+                _insert_states(
+                    instance,
+                    set_busy_timeout=False,
+                    cancel_event=self._cancel_event,
+                    **self._kwargs,
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - relayed to the caller
+            # Never let this escape into the recorder's task loop, which would
+            # make it tear down and reopen its event session.
+            self._future.set_exception(exc)
+
+
+def _insert_states(
     recorder_instance: Any,
     dest_entity_id: str,
     source_states: list,
@@ -1196,42 +1255,18 @@ def _insert_states_chunked(
     transform: Callable[[float], float] | None = None,
     overwrite: bool = False,
     cancel_event: threading.Event | None = None,
-    progress: dict[str, int] | None = None,
+    set_busy_timeout: bool = False,
 ) -> dict[str, Any]:
     """Insert State objects into the recorder database for a destination entity.
 
-    **Atomic whenever it can be.** The work is split into a read-only planning
-    phase and a write phase that writes everything in ONE transaction, so an
-    import is all-or-nothing: either every state lands or none does. On
-    Postgres and MariaDB/MySQL that is always what happens, because row-level
-    locking means a long write transaction does not hold the recorder up.
+    **Atomic.** Everything is written in one transaction: either every state
+    (and, in overwrite mode, every deletion) lands, or none of it does and the
+    database is exactly as it was. There is no size at which this degrades.
 
-    SQLite is the exception, having a single writer. The transaction is still
-    attempted, and it measures itself as it goes: if the projected time to
-    finish would hold the write lock past `_ATOMIC_BUDGET_S`, the attempt is
-    rolled back before anything is committed and the import is rewritten in
-    paced chunks instead. In practice this only happens for imports of roughly
-    a million states or more. See the note near the top of this module.
-
-    The returned `atomic` flag says which of the two ran.
-
-    **The fallback is resumable**, since it is no longer all-or-nothing: each
-    group of states is written in the direction that lets a re-run pick up
-    where an interrupted one stopped.
-
-    - Head fill goes first and writes its newest chunk first, so the
-      destination's coverage grows backwards contiguously and the next run's
-      cutoff resumes exactly at the boundary. It goes first because it is the
-      point of the import; leaving it until last would mean an interrupted run
-      often wrote no history at all.
-    - Trailing fill goes forward in time. Writing its newest states first would
-      move the destination's newest good entry to ~now, which switches the
-      trailing branch off entirely on the next run (it is gated on how far the
-      destination is behind), stranding the states in between.
-    - Mid-stream fill is direction-independent: filling from either end shrinks
-      the gap towards the same residual.
-    - Overwrite replaces one time window per transaction, forwards, so a
-      committed window is never left deleted-but-not-replaced.
+    Normally called on the recorder's own thread, through `_ImportStatesTask`,
+    so it shares the recorder's connection and cannot contend with it for
+    SQLite's single write lock however long it runs. See the write-strategy
+    note near the top of this module.
 
     **Overwrite mode (`overwrite=True`) is destructive.** Every destination row
     inside the source's time span is DELETED and replaced by the source's
@@ -1266,13 +1301,9 @@ def _insert_states_chunked(
     Overwrite re-runs are also stable: the second run deletes the rows the
     first one wrote and rewrites identical values.
 
-    Cancellation: `cancel_event` is checked as the write proceeds. A cancelled
-    single transaction rolls back and writes nothing; a cancelled fallback run
-    stops cleanly and keeps what it has already committed. Either way it
-    returns with `cancelled` True.
-
-    `progress` is updated with the committed row count after every chunk, so a
-    caller can still report how much landed when this raises part-way.
+    Cancellation: `cancel_event` is checked between INSERT batches. Because
+    nothing is committed until the end, a cancelled import rolls back and
+    leaves the database untouched, returning with `cancelled` True.
 
     Returns a dict of counters plus `imported_min_ts` / `imported_max_ts`
     (None if nothing was imported) and `debug_records`, one entry per source
@@ -1289,21 +1320,21 @@ def _insert_states_chunked(
     gap_intervals_count = 0
     overwritten = 0
     overwrite_span: tuple[float, float] | None = None
-    # (states, newest_chunk_first) in the order they should be committed.
-    write_groups: list[tuple[list, bool]] = []
     cancelled = False
-    atomic = True
     debug_records: list[dict] = []
     session = recorder_instance.get_session()
 
     try:
-        _set_sqlite_busy_timeout(session)
+        if set_busy_timeout:
+            # Only on the fallback path, where this is not the recorder's own
+            # connection and so must not be left with an altered pragma... it
+            # is a worker connection, and waiting beats failing fast.
+            _set_sqlite_busy_timeout(session)
 
-        # ============== PHASE 1: plan the import (read-only) ==============
-        # Nothing below writes, so no write lock is taken while the (possibly
-        # very large) source series is classified. The read transaction is
-        # released before the write phase begins, so a long plan does not pin
-        # an old database snapshot either.
+        # ============== PHASE 1: plan the import ==============
+        # Nothing below writes. It shares a transaction with the write phase,
+        # so the destination's cutoff is read and acted on atomically: no
+        # TOCTOU race.
 
         # -- Look up StatesMeta for the destination entity --
         # Creating it when missing is deferred to the write phase.
@@ -1361,9 +1392,6 @@ def _insert_states_chunked(
             # same transaction as the inserts that replace it, so no committed
             # window is ever left deleted-but-not-replaced.
             to_import = list(source_states)
-            # One window per chunk, forwards, each replaced in a single
-            # transaction.
-            write_groups = [(to_import, False)]
             # The span is the source's own data range, so the blast radius is
             # exactly what the source can replace. It is reported back to the
             # UI so the user sees the window before (and after) committing.
@@ -1417,10 +1445,6 @@ def _insert_states_chunked(
             )
         elif min_ts is None and not head_dedup_ts:
             to_import = list(source_states)
-            # Same resumability rule as head fill: the destination's oldest
-            # entry is the cutoff a re-run reads, so coverage has to grow
-            # backwards contiguously.
-            write_groups = [(to_import, True)]
             for s in source_states:
                 src_val = str(s.state) if s.state is not None else None
                 rec = {
@@ -1649,11 +1673,6 @@ def _insert_states_chunked(
                 debug_records.append(rec)
 
             to_import = head + mid_stream + trailing
-            write_groups = [
-                (head, True),
-                (mid_stream, False),
-                (trailing, False),
-            ]
             mid_stream_filled = len(mid_stream)
             trailing_filled = len(trailing)
 
@@ -1681,7 +1700,7 @@ def _insert_states_chunked(
 
         if not to_import or dry_run:
             # Nothing to write (or only previewing): drop the read snapshot.
-            session.rollback()
+            session.rollback()  # noqa: ERA001 - releases the transaction
             if dry_run:
                 inserted = len(to_import)
                 if to_import:
@@ -1703,7 +1722,6 @@ def _insert_states_chunked(
                 "imported_min_ts": imported_min_ts,
                 "imported_max_ts": imported_max_ts,
                 "cancelled": False,
-                "atomic": True,
                 "debug_records": debug_records,
             }
 
@@ -1712,43 +1730,49 @@ def _insert_states_chunked(
         # chunking below relies on to carve contiguous time windows.
 
         # ====================== PHASE 2: write ======================
-        # The read snapshot is dropped first, so the write below starts from a
-        # current view of the database.
-        session.rollback()
+        # Same transaction as the plan above, committed once at the end. On
+        # the recorder thread there is no other writer to hold up, so this can
+        # take as long as it needs.
 
         # -- Create the destination's StatesMeta row if it does not exist --
         if metadata_id == -1:
             meta = StatesMeta(entity_id=dest_entity_id)
             session.add(meta)
-            session.commit()
+            session.flush()
             metadata_id = meta.metadata_id
 
-        # -- First choice: the whole import in one transaction --
-        outcome = _write_in_one_transaction(
-            session,
-            dest_entity_id,
-            metadata_id,
-            to_import,
-            transform=transform,
-            overwrite=overwrite,
-            overwrite_span=overwrite_span,
-            budget_s=_ATOMIC_BUDGET_S if _is_sqlite(session) else None,
-            cancel_event=cancel_event,
-        )
-
-        if outcome == "cancelled":
-            # Rolled back, so nothing was written at all.
-            cancelled = True
-            _LOGGER.warning(
-                "Import into %s cancelled before it committed; nothing was "
-                "written",
-                dest_entity_id,
+        if overwrite and overwrite_span is not None:
+            # Same transaction as the inserts that replace these rows, so a
+            # failure can never leave the span deleted but not rewritten.
+            _delete_states_in_span(
+                session, metadata_id, overwrite_span[0], overwrite_span[1]
             )
-            imported_min_ts = imported_max_ts = None
-        elif outcome == "committed":
-            inserted = len(to_import)
-            if progress is not None:
-                progress["inserted"] = inserted
+
+        attrs_cache: dict[int, int] = {}
+        for i in range(0, len(to_import), _WRITE_BATCH_ROWS):
+            if cancel_event is not None and cancel_event.is_set():
+                session.rollback()
+                cancelled = True
+                inserted = 0
+                imported_min_ts = imported_max_ts = None
+                _LOGGER.warning(
+                    "Import into %s cancelled before it committed; the "
+                    "database is unchanged",
+                    dest_entity_id,
+                )
+                break
+
+            batch = to_import[i : i + _WRITE_BATCH_ROWS]
+            session.execute(
+                States.__table__.insert(),
+                _build_state_rows(
+                    session, batch, metadata_id, transform, attrs_cache
+                ),
+            )
+            inserted += len(batch)
+        else:
+            # -- One commit: all or nothing --
+            session.commit()
             imported_min_ts = to_import[0].last_updated.timestamp()
             imported_max_ts = to_import[-1].last_updated.timestamp()
             _LOGGER.info(
@@ -1760,130 +1784,14 @@ def _insert_states_chunked(
                 already_covered,
                 overwritten,
             )
-        else:
-            # -- Fallback: too big for one transaction on this database --
-            # Nothing was committed by the attempt above. Rewrite in paced
-            # chunks so the recorder keeps its database between them, ordered
-            # so an interrupted run stays resumable.
-            atomic = False
-            attrs_cache: dict[int, int] = {}
-
-            ordered_chunks: list[list] = []
-            for group, newest_chunk_first in write_groups:
-                if not group:
-                    continue
-                group_chunks = _chunk_states(group, _WRITE_CHUNK_ROWS)
-                ordered_chunks.extend(
-                    reversed(group_chunks) if newest_chunk_first else group_chunks
-                )
-
-            # Reported range covers what actually lands, which is narrower than
-            # the plan when a run is cancelled part-way.
-            imported_min_ts = imported_max_ts = None
-
-            for chunk_no, chunk in enumerate(ordered_chunks, 1):
-                if cancel_event is not None and cancel_event.is_set():
-                    cancelled = True
-                    _LOGGER.warning(
-                        "Import into %s cancelled after %d of %d states "
-                        "(already-committed rows are kept; re-run to finish)",
-                        dest_entity_id,
-                        inserted,
-                        len(to_import),
-                    )
-                    break
-
-                if overwrite:
-                    # Replace exactly this chunk's time window. The window runs
-                    # from this chunk's first timestamp up to (but excluding)
-                    # the next chunk's first timestamp, so the windows tile the
-                    # whole source span with no overlap and no hole.
-                    window_lo = chunk[0].last_updated.timestamp()
-                    next_chunk = (
-                        ordered_chunks[chunk_no]
-                        if chunk_no < len(ordered_chunks)
-                        else None
-                    )
-                    window_hi = (
-                        next_chunk[0].last_updated.timestamp()
-                        if next_chunk is not None
-                        else overwrite_span[1]
-                    )
-                    _delete_states_in_window(
-                        session,
-                        metadata_id,
-                        window_lo,
-                        window_hi,
-                        inclusive_hi=next_chunk is None,
-                    )
-
-                session.execute(
-                    States.__table__.insert(),
-                    _build_state_rows(
-                        session, chunk, metadata_id, transform, attrs_cache
-                    ),
-                )
-                session.commit()
-                inserted += len(chunk)
-                if progress is not None:
-                    progress["inserted"] = inserted
-
-                chunk_lo = chunk[0].last_updated.timestamp()
-                chunk_hi = chunk[-1].last_updated.timestamp()
-                imported_min_ts = (
-                    chunk_lo
-                    if imported_min_ts is None
-                    else min(imported_min_ts, chunk_lo)
-                )
-                imported_max_ts = (
-                    chunk_hi
-                    if imported_max_ts is None
-                    else max(imported_max_ts, chunk_hi)
-                )
-
-                _LOGGER.debug(
-                    "Committed chunk %d/%d (%d/%d states) for %s",
-                    chunk_no,
-                    len(ordered_chunks),
-                    inserted,
-                    len(to_import),
-                    dest_entity_id,
-                )
-
-                # Hand the write lock back so the recorder can commit its own
-                # queue before we take it again.
-                if chunk_no < len(ordered_chunks):
-                    time.sleep(_WRITE_CHUNK_PAUSE_S)
-
-            _LOGGER.info(
-                "Committed %d states for %s in %d chunk(s) (%d source states "
-                "already covered, %d destination rows replaced, cancelled=%s)",
-                inserted,
-                dest_entity_id,
-                len(ordered_chunks),
-                already_covered,
-                overwritten,
-                cancelled,
-            )
 
     except Exception:
         session.rollback()
-        if inserted:
-            # Only reachable on the chunked fallback: chunks committed before
-            # the failure are kept on purpose, so re-running finishes the
-            # import instead of starting over.
-            _LOGGER.error(
-                "Import into %s failed after %d state(s) were committed. "
-                "Re-run the same import to complete it",
-                dest_entity_id,
-                inserted,
-            )
-        else:
-            _LOGGER.error(
-                "Rolling back the entire import for %s; no states were "
-                "written and no rows were deleted",
-                dest_entity_id,
-            )
+        _LOGGER.error(
+            "Rolling back the entire import for %s; no states were written "
+            "and no rows were deleted",
+            dest_entity_id,
+        )
         raise
     finally:
         session.close()
@@ -1903,89 +1811,8 @@ def _insert_states_chunked(
         "imported_min_ts": imported_min_ts,
         "imported_max_ts": imported_max_ts,
         "cancelled": cancelled,
-        "atomic": atomic,
         "debug_records": debug_records,
     }
-
-
-def _write_in_one_transaction(
-    session: Any,
-    dest_entity_id: str,
-    metadata_id: int,
-    to_import: list,
-    *,
-    transform: Callable[[float], float] | None,
-    overwrite: bool,
-    overwrite_span: tuple[float, float] | None,
-    budget_s: float | None,
-    cancel_event: threading.Event | None,
-) -> str:
-    """Write the whole import in one transaction. Returns what happened.
-
-    `"committed"` means every state (and, in overwrite mode, every deletion)
-    landed together. `"cancelled"` and `"too_slow"` both mean the transaction
-    was rolled back and NOTHING was written, so the caller is free to do as it
-    likes afterwards.
-
-    `budget_s` caps how long the write lock may be held, and is only set for
-    SQLite, the one engine where holding it makes the recorder wait. Rather
-    than guess from a row count, which would be wrong on any disk faster or
-    slower than the one a guess was tuned on, the write measures its own rate
-    and extrapolates after every `_ATOMIC_PROBE_ROWS`. It gives up as soon as
-    the projection says it will not make the budget, which costs at most one
-    probe's worth of thrown-away work.
-    """
-    attrs_cache: dict[int, int] = {}
-    total = len(to_import)
-    started = time.monotonic()
-    try:
-        if overwrite and overwrite_span is not None:
-            _delete_states_in_window(
-                session,
-                metadata_id,
-                overwrite_span[0],
-                overwrite_span[1],
-                inclusive_hi=True,
-            )
-
-        written = 0
-        for i in range(0, total, _ATOMIC_PROBE_ROWS):
-            if cancel_event is not None and cancel_event.is_set():
-                session.rollback()
-                return "cancelled"
-
-            batch = to_import[i : i + _ATOMIC_PROBE_ROWS]
-            session.execute(
-                States.__table__.insert(),
-                _build_state_rows(
-                    session, batch, metadata_id, transform, attrs_cache
-                ),
-            )
-            written += len(batch)
-
-            if budget_s is None or written >= total:
-                continue
-            elapsed = time.monotonic() - started
-            projected = elapsed / written * total
-            if projected > budget_s:
-                session.rollback()
-                _LOGGER.info(
-                    "Import into %s is too large to write in one transaction "
-                    "on this database (%d states, projected %.1fs of write "
-                    "lock against a %.1fs budget). Nothing was written; "
-                    "rewriting it in batches so the recorder keeps working",
-                    dest_entity_id,
-                    total,
-                    projected,
-                    budget_s,
-                )
-                return "too_slow"
-
-        session.commit()
-        return "committed"
-    except Exception:
-        session.rollback()
-        raise
 
 
 def _build_state_rows(
@@ -2045,56 +1872,27 @@ def _build_state_rows(
     return rows
 
 
-def _chunk_states(states: list, chunk_size: int) -> list[list]:
-    """Split a chronological state list into chunks of about `chunk_size`.
-
-    A chunk never ends in the middle of a run of identical timestamps. Overwrite
-    mode derives each chunk's delete window from the next chunk's first
-    timestamp, so a boundary that splits equal timestamps would make one
-    transaction delete rows the previous one just inserted.
-    """
-    chunks: list[list] = []
-    i = 0
-    total = len(states)
-    while i < total:
-        end = min(i + chunk_size, total)
-        if end < total:
-            boundary_ts = states[end - 1].last_updated.timestamp()
-            while end < total and states[end].last_updated.timestamp() == boundary_ts:
-                end += 1
-        chunks.append(states[i:end])
-        i = end
-    return chunks
-
-
-def _delete_states_in_window(
+def _delete_states_in_span(
     session: Any,
     metadata_id: int,
-    window_lo: float,
-    window_hi: float,
-    *,
-    inclusive_hi: bool,
+    span_lo: float,
+    span_hi: float,
 ) -> None:
-    """Delete a destination entity's state rows inside one time window.
+    """Delete a destination entity's state rows inside the source's time span.
 
     Used by overwrite mode, in the same transaction as the inserts that replace
-    the window. Rows OUTSIDE the window can still reference a deleted row
-    through `old_state_id` (a self-referencing FK), so those references are
-    nulled first, exactly as HA's own purge does, or the DELETE fails on
-    engines that enforce the constraint.
+    them. Rows OUTSIDE the span can still reference a deleted row through
+    `old_state_id` (a self-referencing FK), so those references are nulled
+    first, exactly as HA's own purge does, or the DELETE fails on engines that
+    enforce the constraint.
     """
-    upper = (
-        States.last_updated_ts <= window_hi
-        if inclusive_hi
-        else States.last_updated_ts < window_hi
-    )
     doomed_ids = [
         row[0]
         for row in session.query(States.state_id)
         .filter(
             States.metadata_id == metadata_id,
-            States.last_updated_ts >= window_lo,
-            upper,
+            States.last_updated_ts >= span_lo,
+            States.last_updated_ts <= span_hi,
         )
         .all()
     ]

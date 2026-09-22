@@ -8,8 +8,8 @@ Built for migrating sensor data between integrations — for example, when repla
 
 - **Sidebar panel** with a simple UI: select source/destination pairs, click Import
 - **Imports both states and long-term statistics** (hourly aggregates for energy dashboard / long-term graphs)
-- **Atomic**: an import is written in a single transaction, so either all of it lands or none of it does
-- **Never blocks the recorder**: Home Assistant keeps recording normally throughout, even during a very large import
+- **Atomic**: an import is written in a single transaction, at any size, so either all of it lands or none of it does
+- **Never blocks the recorder**: the write goes through Home Assistant's own recorder queue, so it cannot lock the recorder out of its database
 - **Idempotent**: safe to re-run; a successful import shifts the cutoff so nothing is re-imported
 - **Optional overwrite mode** for destinations holding known-bad data (opt-in, destructive, clearly warned)
 - **Entity filter** to quickly find sensors by keyword
@@ -22,7 +22,7 @@ Built for migrating sensor data between integrations — for example, when repla
 2. Queries the destination entity's **oldest good entry**. Hidden `unavailable`/`unknown` rows are not counted as coverage: a destination whose earliest rows are just unavailable markers (common when the entity id existed before, e.g. as a ghost of a removed integration) has no visible history there
 3. Imports only source states that are **strictly older** than that oldest good entry, skipping any exact-timestamp duplicates. This prevents overlap or duplication
 4. Imports **long-term statistics** (hourly mean/min/max/sum) via the official `async_import_statistics` API, which is inherently deduplicated by the database schema
-5. Commits everything in a **single transaction**, so if anything fails the whole import is rolled back and you can safely retry. The write is fast enough that the recorder never notices it: an ordinary import holds the database for a fraction of a second
+5. Commits everything in a **single transaction**, so if anything fails the whole import is rolled back and you can safely retry
 
 ### What gets imported
 
@@ -111,13 +111,15 @@ data:
 - **A destination that already restarted from zero can be repaired from the panel.** If an earlier import left the destination with its history intact but its own later rows counting up from zero, the import result says so and offers a **Repair running total** button. It lifts every statistics row from the restart point onwards by the total the series had reached, using Home Assistant's own statistics-adjustment mechanism, so the two halves line up and future readings continue from the corrected total. Rows before the restart point are untouched and per-hour and per-day figures do not change. Nothing is repaired unless you click it, and the offer only appears when the series shows a single unambiguous restart (a sensor whose total legitimately goes down, such as a bidirectional one, is not flagged).
 - **Spikes that reappear after a restart are a separate sensor issue, not this integration.** Some energy sensors (solar inverters especially) briefly report `0` while Home Assistant restarts, for example during a HAOS or core update. Home Assistant then counts the jump from `0` back up to the real reading as an hour of consumption, which shows as a spike. This happens on every restart, with or without this integration, and no statistics adjustment can prevent it (the realignment above neither causes nor fixes it). The durable fix is at the source: make the sensor report `unavailable` (which Home Assistant ignores) instead of `0` during restarts, usually with a template sensor that has an `availability` condition, then point the Energy dashboard at that clean sensor. See the community write-ups on [energy dashboard spikes](https://community.home-assistant.io/t/data-spikes-in-the-energy-dashboard/469843).
 
-### Very large imports
+### How a large import stays out of the recorder's way
 
-Home Assistant purges raw states after about 10 days by default, so most imports are well under a hundred thousand states and are written in one transaction in about a second.
+SQLite allows only one writer at a time, so a long write transaction on a second connection stops the recorder writing. If that goes on long enough the recorder gives up on its pending events and discards them, which is lost history.
 
-SQLite, unlike PostgreSQL and MariaDB/MySQL, allows only one writer at a time, so on SQLite a very large import is the one case where a single transaction cannot work: holding the database for that long would stop the recorder writing, and a recorder that cannot write builds up a backlog that a restart would discard. The import measures its own speed as it goes and, if it can see it will not finish in time, rolls back before anything is committed and rewrites itself in batches instead. On a fast disk that threshold is somewhere above a quarter of a million states, and it scales down automatically on slower hardware.
+Rather than give up all-or-nothing imports to avoid that, the import does not take a second connection at all. It is queued onto Home Assistant's **recorder thread** and runs on the recorder's own connection, the same way Home Assistant's own bulk statistics import does. There is then no second writer, so no amount of work can lock the recorder out. Events queue up while the import runs and are written immediately afterwards, which is ordinary recorder behaviour.
 
-A batched import is the one case that is not all-or-nothing, so it is written to be resumable instead: batches are ordered so that if one is interrupted, whatever landed is kept and re-running the same import continues from there. The import summary says when this happened. PostgreSQL and MariaDB/MySQL have row-level locking and are never batched.
+Rows are written with a multi-row insert, roughly an order of magnitude faster than one row at a time, which keeps that window short: about a second per 100,000 states. Since Home Assistant purges raw states after about 10 days by default, most imports are well under that.
+
+An import can also be stopped. Reloading or disabling the integration, or shutting Home Assistant down, cancels one that is running; because nothing is committed until the end, a cancelled import leaves the database exactly as it was.
 
 ## Requirements
 
