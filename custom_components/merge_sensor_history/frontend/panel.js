@@ -1773,8 +1773,8 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           const aftermath = r.dry_run
             ? "This was a preview only, so nothing was written."
             : written > 0
-              ? `${written.toLocaleString()} state(s) were already written and have been kept. Re-run the same import to continue from there.`
-              : "Nothing was written. Re-run the import once the cause is resolved.";
+              ? `This import was too large for a single transaction, so it was written in batches. ${written.toLocaleString()} state(s) landed before it stopped and have been kept. Re-run the same import to continue from there.`
+              : "The import was rolled back, so nothing was written. Re-run it once the cause is resolved.";
           return `<div class="result-item result-error">
             <div class="result-header">
               <span class="result-icon">&#10060;</span>
@@ -1851,6 +1851,8 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           if (!r.fill_gaps && !r.overwrite && r.states_already_covered > 0)
             grid += `<span class="result-stat-range" style="grid-column:1/-1">Skipped states fall inside the destination's existing range. If part of that range looks empty in the History panel, enable <strong>Fill mid-stream gaps</strong> under Options and run a Preview to see what could be imported.</span>`;
           grid += `<span class="result-stat-value">${r.states_imported.toLocaleString()}</span><span class="result-stat-label">${actionVerb}</span>`;
+          if (r.states_atomic === false)
+            grid += `<span class="result-stat-range" style="grid-column:1/-1">Too large to write in one transaction on this database, so it was written in batches to keep the recorder running. Had it been interrupted, whatever landed would have been kept and re-running would have continued from there.</span>`;
           if (r.states_mid_stream_filled > 0)
             grid += `<span class="result-stat-value">${r.states_mid_stream_filled.toLocaleString()}</span><span class="result-stat-label">&nbsp;&nbsp;&mdash; mid-stream gap-fill</span>`;
           if (r.states_trailing_filled > 0)
