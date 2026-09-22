@@ -1897,6 +1897,11 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             grid += `<span class="result-stat-range" style="grid-column:1/-1">Cumulative-sum offset ${r.dry_run ? "would be applied" : "applied"}: <strong>${offsetStr}</strong> (aligns energy totals at splice point)</span>`;
             grid += `<span class="result-stat-range" style="grid-column:1/-1">The oldest imported hour absorbs this offset, so it can show a one-off value in the Energy dashboard's all-time total. Your hourly/daily usage graph is unaffected; correct that single hour under Developer Tools → Statistics if you want a perfect lifetime total.</span>`;
           }
+          if (r.stats_unit_mismatch) {
+            const su = this._esc(r.stats_unit_mismatch.source || "no unit");
+            const du = this._esc(r.stats_unit_mismatch.destination || "no unit");
+            grid += `<span class="result-stat-range" style="grid-column:1/-1;color:var(--error-color,#db4437)">&#9888;&#65039; The source's statistics are stored in <strong>${su}</strong> but the destination's in <strong>${du}</strong>. Values ${r.dry_run ? "would be" : "were"} imported exactly as stored, with no conversion. If they need scaling, enable <strong>Adjust imported values</strong> under Options${r.scale_factor || r.value_function ? " (already set for this run)" : ""}.</span>`;
+          }
           if (r.stats_sum_seeded !== null && r.stats_sum_seeded !== undefined) {
             const seedStr = this._formatOffset(r.stats_sum_seeded, r.stats_unit);
             grid += r.dry_run

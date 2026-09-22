@@ -33,7 +33,6 @@ from homeassistant.components.recorder.history import get_significant_states
 from homeassistant.components.recorder.statistics import (
     async_import_statistics,
     get_metadata,
-    statistics_during_period,
 )
 from homeassistant.components.recorder.models import (
     StatisticData,
@@ -359,6 +358,20 @@ def _scale_stat_rows(
     return scaled
 
 
+def _unit_class_for(unit: str | None) -> str | None:
+    """The unit class Home Assistant groups a unit under, or None.
+
+    Best effort, and only used to fill in metadata this integration creates:
+    the mapping covers HA's primary converters, so a unit belonging to one of
+    the secondary ones (ozone, temperature delta and friends) resolves to the
+    primary class that shares it. HA derives the real class from the device
+    class, which is not available here, and leaves any `unit_class` already in
+    metadata alone.
+    """
+    converter = STATISTIC_UNIT_TO_UNIT_CONVERTER.get(unit)
+    return converter.UNIT_CLASS if converter is not None else None
+
+
 def _ensure_unit_class(metadata: dict[str, Any]) -> None:
     """Populate ``unit_class`` on import metadata when it is absent.
 
@@ -370,9 +383,41 @@ def _ensure_unit_class(metadata: dict[str, Any]) -> None:
     """
     if "unit_class" in metadata:
         return
-    unit = metadata.get("unit_of_measurement")
-    converter = STATISTIC_UNIT_TO_UNIT_CONVERTER.get(unit)
-    metadata["unit_class"] = converter.UNIT_CLASS if converter is not None else None
+    metadata["unit_class"] = _unit_class_for(metadata.get("unit_of_measurement"))
+
+
+def _resolve_target_unit(
+    hass: HomeAssistant,
+    dest_id: str,
+    dest_metadata_map: dict | None,
+    source_unit: str | None,
+    allow_source_fallback: bool,
+) -> str | None:
+    """The unit imported statistics are written in.
+
+    Statistics are STORED in the unit recorded in `statistics_meta`, which is
+    fixed for the life of a statistic: `sensor/recorder.py` pins it ("We have
+    seen this sensor before, use the unit from metadata") and converts
+    incoming states into it. The unit on the entity is only a DISPLAY unit,
+    which a user can change in the entity settings, and reads convert storage
+    to display on the way out.
+
+    So the destination's stored unit is the answer whenever it has one. A
+    destination with no statistics yet is about to have metadata created, and
+    that takes its current display unit, or the source's unit when the
+    destination has no state either (a disabled or not-yet-loaded entity).
+    That last fallback is skipped when a value adjustment is in force, since
+    the adjusted values are no longer in the source's unit.
+    """
+    entry = dest_metadata_map.get(dest_id) if dest_metadata_map else None
+    if entry:
+        return entry[1].get("unit_of_measurement")
+
+    state = hass.states.get(dest_id)
+    if state:
+        return state.attributes.get("unit_of_measurement")
+
+    return source_unit if allow_source_fallback else None
 
 
 def _hash_panel_file(panel_path: str) -> str:
@@ -780,6 +825,7 @@ async def _async_import_pair(
         "stats_realigned_by": None,  # Amount the dest running total was lifted (or None)
         "stats_sum_seeded": None,  # Running total seeded for the destination's future rows
         "stats_detached": None,  # Detected restart-from-zero cliff, repairable on request
+        "stats_unit_mismatch": None,  # Set when source and destination units differ
         "stats_unit": None,  # Unit of measurement for display
         # Short-term statistics (5-minute) — populated only when fill_gaps=True
         "stats_short_source_total": 0,
@@ -2273,6 +2319,7 @@ async def _async_import_statistics_for_pair(
         "stats_sum_seeded": None,
         "stats_detached": None,
         "stats_unit": None,
+        "stats_unit_mismatch": None,
         "debug_stats": [],
     }
 
@@ -2292,11 +2339,35 @@ async def _async_import_statistics_for_pair(
     recent_cutoff_ts = recent_cutoff_dt.timestamp()
 
     # -- Query source + destination stats in parallel (single executor call each) --
-    source_stats_raw, dest_stats_raw, dest_metadata_map = (
+    source_stats_raw, dest_stats_raw, dest_metadata_map, target = (
         await recorder.async_add_executor_job(
-            _fetch_stats_snapshot, hass, source_id, dest_id
+            _fetch_stats_snapshot,
+            hass,
+            recorder,
+            source_id,
+            dest_id,
+            transform is None,
         )
     )
+    out["stats_unit"] = target["unit"]
+    if target["units_differ"]:
+        # Not converted for you: a factor can mean a unit change or something
+        # else entirely, and silently guessing would double up with any
+        # adjustment already set, and would disagree with the raw-state import,
+        # which has no unit handling of its own.
+        out["stats_unit_mismatch"] = {
+            "source": target["source_unit"],
+            "destination": target["unit"],
+        }
+        _LOGGER.warning(
+            "Source %s stores its statistics in %s but the destination %s "
+            "stores %s. The values are imported exactly as stored; use the "
+            "value adjustment option if they need scaling",
+            source_id,
+            target["source_unit"],
+            dest_id,
+            target["unit"],
+        )
 
     source_rows = source_stats_raw.get(source_id, [])
     dest_rows = dest_stats_raw.get(dest_id, [])
@@ -2342,9 +2413,11 @@ async def _async_import_statistics_for_pair(
         # repairing that does not need the source at all.
         return out
 
-    # -- Apply the unit scaling factor BEFORE any splice math --
+    # -- Apply the user's value adjustment BEFORE any splice math --
     # The sum offset and column merges below must operate in the destination's
-    # value space, so the source rows are converted first.
+    # value space, so the source rows are adjusted first. This is the only
+    # thing that rescales values, for statistics and raw states alike, which
+    # is what keeps the two halves of an import consistent with each other.
     source_rows = _scale_stat_rows(source_rows, transform)
 
     source_has_sum_values = any(r.get("sum") is not None for r in source_rows)
@@ -2474,24 +2547,17 @@ async def _async_import_statistics_for_pair(
     dest_meta_entry = dest_metadata_map.get(dest_id) if dest_metadata_map else None
     existing_metadata = dest_meta_entry[1] if dest_meta_entry else None
 
-    unit: str | None = None
+    # The unit every value in this function is expressed in: the destination's
+    # stored unit, which is what the rows were read in and what will be
+    # written back. Never the entity's display unit (see _resolve_target_unit).
+    unit: str | None = target["unit"]
     if existing_metadata:
         # Reuse the destination's current metadata verbatim, except that we
         # force statistic_id and source (these must match for async_import_statistics).
         metadata = dict(existing_metadata)
         metadata["statistic_id"] = dest_id
         metadata["source"] = "recorder"
-        unit = metadata.get("unit_of_measurement")
     else:
-        # Destination has no metadata yet — construct from the live sensor.
-        # With a scaling factor the source's unit no longer matches the scaled
-        # values, so only the destination's unit is trusted.
-        state_obj = hass.states.get(dest_id) or (
-            None if transform is not None else hass.states.get(source_id)
-        )
-        if state_obj:
-            unit = state_obj.attributes.get("unit_of_measurement")
-
         meta_kwargs: dict[str, Any] = {
             "has_sum": has_sum,
             "name": None,
@@ -2507,7 +2573,6 @@ async def _async_import_statistics_for_pair(
             meta_kwargs["has_mean"] = has_mean
         metadata = StatisticMetaData(**meta_kwargs)
 
-    out["stats_unit"] = unit
     _ensure_unit_class(metadata)
 
     # --- Seed the destination's running total when it has no chain to continue ---
@@ -2830,59 +2895,118 @@ def _repair_sum_series(
         session.close()
 
 
+def _read_stored_statistics(
+    session: Any, statistic_id: str, table: Any
+) -> list[dict]:
+    """Read one statistic's rows exactly as they are stored.
+
+    Deliberately not `statistics_during_period`, which always converts to the
+    entity's display unit. Asking it for a specific unit instead means
+    matching the unit-class key HA derives internally, which comes from the
+    class declared in metadata before the unit, and whose unit-keyed map omits
+    HA's secondary converters. A key that does not match fails silently, back
+    to display units. Reading the columns has no key to get wrong, and puts
+    these rows in the same space as the detachment detector and the repair.
+    """
+    metadata_id = (
+        session.query(StatisticsMeta.id)
+        .filter(StatisticsMeta.statistic_id == statistic_id)
+        .scalar()
+    )
+    if metadata_id is None:
+        return []
+    return [
+        {
+            "start": row[0],
+            "mean": row[1],
+            "min": row[2],
+            "max": row[3],
+            "sum": row[4],
+            "state": row[5],
+        }
+        for row in session.query(
+            table.start_ts,
+            table.mean,
+            table.min,
+            table.max,
+            table.sum,
+            table.state,
+        )
+        .filter(table.metadata_id == metadata_id)
+        .order_by(table.start_ts.asc())
+        .all()
+    ]
+
+
 def _fetch_stats_snapshot(
-    hass: HomeAssistant, source_id: str, dest_id: str
-) -> tuple[dict, dict, dict]:
-    """Fetch source stats, destination stats, and destination metadata in the
-    recorder thread (single executor call)."""
-    types = {"mean", "min", "max", "sum", "state"}
-    source_stats = statistics_during_period(
-        hass,
-        _EPOCH,
-        None,
-        statistic_ids={source_id},
-        period="hour",
-        units=None,
-        types=types,
+    hass: HomeAssistant,
+    recorder_instance: Any,
+    source_id: str,
+    dest_id: str,
+    allow_source_fallback: bool,
+) -> tuple[dict, dict, dict, dict]:
+    """Hourly source and destination rows, as stored, plus the unit context."""
+    return _fetch_period_snapshot(
+        hass, recorder_instance, source_id, dest_id, Statistics,
+        allow_source_fallback,
     )
-    dest_stats = statistics_during_period(
-        hass,
-        _EPOCH,
-        None,
-        statistic_ids={dest_id},
-        period="hour",
-        units=None,
-        types=types,
-    )
-    dest_metadata = get_metadata(hass, statistic_ids={dest_id})
-    return source_stats, dest_stats, dest_metadata
 
 
 def _fetch_short_term_stats_snapshot(
-    hass: HomeAssistant, source_id: str, dest_id: str
-) -> tuple[dict, dict, dict]:
-    """Fetch short-term (5-minute) source and destination stats + dest metadata."""
-    types = {"mean", "min", "max", "sum", "state"}
-    source_stats = statistics_during_period(
-        hass,
-        _EPOCH,
-        None,
-        statistic_ids={source_id},
-        period="5minute",
-        units=None,
-        types=types,
+    hass: HomeAssistant,
+    recorder_instance: Any,
+    source_id: str,
+    dest_id: str,
+    allow_source_fallback: bool,
+) -> tuple[dict, dict, dict, dict]:
+    """Same as `_fetch_stats_snapshot` for the 5-minute table."""
+    return _fetch_period_snapshot(
+        hass, recorder_instance, source_id, dest_id, StatisticsShortTerm,
+        allow_source_fallback,
     )
-    dest_stats = statistics_during_period(
-        hass,
-        _EPOCH,
-        None,
-        statistic_ids={dest_id},
-        period="5minute",
-        units=None,
-        types=types,
-    )
+
+
+def _fetch_period_snapshot(
+    hass: HomeAssistant,
+    recorder_instance: Any,
+    source_id: str,
+    dest_id: str,
+    table: Any,
+    allow_source_fallback: bool,
+) -> tuple[dict, dict, dict, dict]:
+    """Read one period's source and destination rows in their stored units.
+
+    Returns the source rows, the destination rows, the destination's metadata
+    and the unit context: the unit the import will write in, and whether the
+    source's stored unit differs from it (in which case nothing is converted
+    and the user has to say what to do about it).
+    """
     dest_metadata = get_metadata(hass, statistic_ids={dest_id})
-    return source_stats, dest_stats, dest_metadata
+    source_metadata = get_metadata(hass, statistic_ids={source_id})
+    source_entry = source_metadata.get(source_id) if source_metadata else None
+    source_unit = (
+        source_entry[1].get("unit_of_measurement") if source_entry else None
+    )
+
+    target_unit = _resolve_target_unit(
+        hass, dest_id, dest_metadata, source_unit, allow_source_fallback
+    )
+
+    session = recorder_instance.get_session()
+    try:
+        source_rows = _read_stored_statistics(session, source_id, table)
+        dest_rows = _read_stored_statistics(session, dest_id, table)
+    finally:
+        session.close()
+
+    target = {
+        "unit": target_unit,
+        "source_unit": source_unit,
+        # Both sides are read as stored, so a difference here is a real
+        # difference in the numbers, not a display setting.
+        "units_differ": bool(source_entry and source_unit != target_unit),
+    }
+    return {source_id: source_rows}, {dest_id: dest_rows}, dest_metadata, target
 
 
 async def _async_import_short_term_statistics_for_pair(
@@ -2942,9 +3066,14 @@ async def _async_import_short_term_statistics_for_pair(
     recent_cutoff_dt = floor_5min - timedelta(minutes=10)
     recent_cutoff_ts = recent_cutoff_dt.timestamp()
 
-    source_stats_raw, dest_stats_raw, dest_metadata_map = (
+    source_stats_raw, dest_stats_raw, dest_metadata_map, target = (
         await recorder.async_add_executor_job(
-            _fetch_short_term_stats_snapshot, hass, source_id, dest_id
+            _fetch_short_term_stats_snapshot,
+            hass,
+            recorder,
+            source_id,
+            dest_id,
+            transform is None,
         )
     )
 
@@ -3082,18 +3211,13 @@ async def _async_import_short_term_statistics_for_pair(
         metadata["statistic_id"] = dest_id
         metadata["source"] = "recorder"
     else:
-        # With a scaling factor the source's unit no longer matches the scaled
-        # values, so only the destination's unit is trusted (see LTS path).
-        state_obj = hass.states.get(dest_id) or (
-            None if transform is not None else hass.states.get(source_id)
-        )
-        unit = state_obj.attributes.get("unit_of_measurement") if state_obj else None
+        # Same stored-unit rule as the hourly path.
         meta_kwargs: dict[str, Any] = {
             "has_sum": has_sum,
             "name": None,
             "source": "recorder",
             "statistic_id": dest_id,
-            "unit_of_measurement": unit,
+            "unit_of_measurement": target["unit"],
         }
         if StatisticMeanType is not None:
             meta_kwargs["mean_type"] = (
