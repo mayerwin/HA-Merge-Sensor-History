@@ -416,6 +416,25 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           opacity: 0.6;
           cursor: default;
         }
+        .suggest-btn {
+          margin-top: 6px;
+          padding: 4px 10px;
+          border-radius: 4px;
+          border: 1px solid var(--primary-color, #03a9f4);
+          background: var(--primary-color, #03a9f4);
+          color: #fff;
+          font-size: 13px;
+          font-style: normal;
+          cursor: pointer;
+        }
+        .suggest-btn:disabled {
+          opacity: 0.6;
+          cursor: default;
+        }
+        .suggest-outcome {
+          color: var(--primary-text-color);
+          font-style: normal;
+        }
         .repair-outcome {
           margin-top: 8px;
           font-size: 13px;
@@ -993,6 +1012,11 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       const repairBtn = ev.target.closest(".repair-btn");
       if (repairBtn) {
         this._repairSumSeries(repairBtn);
+        return;
+      }
+      const suggestBtn = ev.target.closest(".suggest-btn");
+      if (suggestBtn) {
+        this._applyUnitSuggestion(suggestBtn);
         return;
       }
       const btn = ev.target.closest(".debug-dl-btn");
@@ -1621,6 +1645,60 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     }
   }
 
+  /** The rest of the units-differ warning: the usual conversion between the
+   *  two units, with a button that fills it in under Options. Only ever a
+   *  suggestion: nothing is applied until the user runs the import with it,
+   *  and they can change it first. */
+  _unitSuggestion(r, pairCount) {
+    const sug = r.stats_unit_mismatch && r.stats_unit_mismatch.suggestion;
+    const setNow = r.scale_factor || r.value_function;
+    if (!sug) {
+      return `If they need scaling, enable <strong>Adjust imported values</strong> under Options${setNow ? " (already set for this run)" : ""}.`;
+    }
+    const isFn = !!sug.value_function;
+    const label = isFn
+      ? `f(v) = ${this._esc(sug.value_function)}`
+      : `&times;${this._esc(String(sug.scale_factor))}`;
+    let text = `The usual conversion is <strong>${label}</strong>.`;
+    const matches = isFn
+      ? r.value_function === sug.value_function
+      : !r.value_function && Number(r.scale_factor) === Number(sug.scale_factor);
+    if (matches) {
+      return `${text} <strong>Adjust imported values</strong> ${r.dry_run ? "is" : "was"} already set to this for this run.`;
+    }
+    if (setNow) text += ` <strong>Adjust imported values</strong> ${r.dry_run ? "is" : "was"} set to something else for this run.`;
+    if (pairCount > 1) {
+      return `${text} <strong>Adjust imported values</strong> applies to every pair in a run, so import this pair on its own to use it.`;
+    }
+    const data = isFn
+      ? `data-fn="${this._esc(sug.value_function)}"`
+      : `data-scale="${this._esc(String(sug.scale_factor))}"`;
+    return `${text}<br/><button class="suggest-btn" ${data}>Use ${label}</button>
+      <span class="suggest-outcome"></span>`;
+  }
+
+  /** Fill a suggested conversion in under Options, exactly as if typed. */
+  _applyUnitSuggestion(btn) {
+    const { scale, fn } = btn.dataset;
+    this._scaleCb.checked = true;
+    if (fn) {
+      this._adjustModeCustom.checked = true;
+      this._customFn.value = fn;
+    } else {
+      this._adjustModeMultiply.checked = true;
+      this._scaleFactor.value = scale;
+    }
+    // Runs the same enable/disable and live-preview sync as a manual change.
+    this._scaleCb.dispatchEvent(new Event("change"));
+    btn.disabled = true;
+    const outcome = btn.parentElement.querySelector(".suggest-outcome");
+    if (outcome) {
+      outcome.textContent =
+        " Filled in under Options. Check it, then run Preview again before importing.";
+    }
+    this._scaleCb.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
   /** Explain a destination whose running total restarted from zero, and offer
    *  the repair. Returns "" when the series is fine. */
   _repairNotice(r) {
@@ -1900,7 +1978,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           if (r.stats_unit_mismatch) {
             const su = this._esc(r.stats_unit_mismatch.source || "no unit");
             const du = this._esc(r.stats_unit_mismatch.destination || "no unit");
-            grid += `<span class="result-stat-range" style="grid-column:1/-1;color:var(--error-color,#db4437)">&#9888;&#65039; The source's statistics are stored in <strong>${su}</strong> but the destination's in <strong>${du}</strong>. Values ${r.dry_run ? "would be" : "were"} imported exactly as stored, with no conversion. If they need scaling, enable <strong>Adjust imported values</strong> under Options${r.scale_factor || r.value_function ? " (already set for this run)" : ""}.</span>`;
+            grid += `<span class="result-stat-range" style="grid-column:1/-1;color:var(--error-color,#db4437)">&#9888;&#65039; The source's statistics are stored in <strong>${su}</strong> but the destination's in <strong>${du}</strong>. Values ${r.dry_run ? "would be" : "were"} imported exactly as stored, with no conversion. ${this._unitSuggestion(r, results.length)}</span>`;
           }
           if (r.stats_sum_seeded !== null && r.stats_sum_seeded !== undefined) {
             const seedStr = this._formatOffset(r.stats_sum_seeded, r.stats_unit);

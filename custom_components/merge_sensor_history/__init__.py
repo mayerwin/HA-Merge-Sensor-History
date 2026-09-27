@@ -372,6 +372,59 @@ def _unit_class_for(unit: str | None) -> str | None:
     return converter.UNIT_CLASS if converter is not None else None
 
 
+def _format_number(value: float) -> str:
+    """A factor as a person would type it: 1000, 0.001, 1.8."""
+    return f"{value:.12g}"
+
+
+def _suggest_unit_adjustment(
+    from_unit: str | None,
+    to_unit: str | None,
+    declared_classes: tuple[str | None, ...] = (),
+) -> dict[str, Any] | None:
+    """The value adjustment that converts `from_unit` into `to_unit`, or None.
+
+    Only a suggestion for the panel to offer: nothing is applied unless the
+    user fills it in, and they can change it. Offered only when both units
+    belong to the same Home Assistant converter, and when no `unit_class`
+    recorded in either sensor's metadata names a different class (HA's
+    unit-keyed map resolves a unit to one class even where it is shared, such
+    as temperature and temperature difference, which convert differently).
+
+    Returns {"scale_factor": a} for a plain factor, {"value_function": ...}
+    when the conversion also has an offset (temperature), or None.
+    """
+    try:
+        converter = STATISTIC_UNIT_TO_UNIT_CONVERTER.get(from_unit)
+        if (
+            converter is None
+            or STATISTIC_UNIT_TO_UNIT_CONVERTER.get(to_unit) is not converter
+        ):
+            return None
+        valid = getattr(converter, "VALID_UNITS", ())
+        if from_unit not in valid or to_unit not in valid:
+            return None
+        if any(c is not None and c != converter.UNIT_CLASS for c in declared_classes):
+            return None
+        offset = float(converter.convert(0.0, from_unit, to_unit))
+        factor = float(converter.convert(1.0, from_unit, to_unit)) - offset
+        check = float(converter.convert(1000.0, from_unit, to_unit))
+    except Exception:
+        return None
+    if not all(math.isfinite(x) for x in (offset, factor, check)) or factor <= 0:
+        return None
+    # Only a straight line can be expressed as an adjustment.
+    if abs(check - (factor * 1000.0 + offset)) > 1e-9 * max(1.0, abs(check)):
+        return None
+    if abs(offset) < 1e-12:
+        if abs(factor - 1.0) < 1e-12:
+            return None
+        return {"scale_factor": float(_format_number(factor))}
+    sign = "+" if offset > 0 else "-"
+    scaled = "v" if abs(factor - 1.0) < 1e-12 else f"v * {_format_number(factor)}"
+    return {"value_function": f"{scaled} {sign} {_format_number(abs(offset))}"}
+
+
 def _ensure_unit_class(metadata: dict[str, Any]) -> None:
     """Populate ``unit_class`` on import metadata when it is absent.
 
@@ -2382,6 +2435,8 @@ async def _async_import_statistics_for_pair(
         out["stats_unit_mismatch"] = {
             "source": target["source_unit"],
             "destination": target["unit"],
+            # Offered in the panel for the user to fill in; never applied here.
+            "suggestion": target["suggestion"],
         }
         _LOGGER.warning(
             "Source %s stores its statistics in %s but the destination %s "
@@ -3024,12 +3079,26 @@ def _fetch_period_snapshot(
     finally:
         session.close()
 
+    # Both sides are read as stored, so a difference here is a real difference
+    # in the numbers, not a display setting.
+    units_differ = bool(source_entry and source_unit != target_unit)
+    dest_entry = dest_metadata.get(dest_id) if dest_metadata else None
     target = {
         "unit": target_unit,
         "source_unit": source_unit,
-        # Both sides are read as stored, so a difference here is a real
-        # difference in the numbers, not a display setting.
-        "units_differ": bool(source_entry and source_unit != target_unit),
+        "units_differ": units_differ,
+        "suggestion": (
+            _suggest_unit_adjustment(
+                source_unit,
+                target_unit,
+                (
+                    source_entry[1].get("unit_class") if source_entry else None,
+                    dest_entry[1].get("unit_class") if dest_entry else None,
+                ),
+            )
+            if units_differ
+            else None
+        ),
     }
     return {source_id: source_rows}, {dest_id: dest_rows}, dest_metadata, target
 
