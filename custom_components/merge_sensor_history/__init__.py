@@ -420,6 +420,23 @@ def _resolve_target_unit(
     return source_unit if allow_source_fallback else None
 
 
+def _is_utility_meter(hass: HomeAssistant, entity_id: str) -> bool:
+    """Whether the entity belongs to the Utility Meter integration.
+
+    Display only. A Utility Meter keeps its running value inside the helper,
+    so its state carries on from there whatever history is imported, and the
+    panel explains the resulting drop in the History graph. Nothing else reads
+    this, and any failure here only means the note is not shown.
+    """
+    try:
+        from homeassistant.helpers import entity_registry as er
+
+        entry = er.async_get(hass).async_get(entity_id)
+        return entry is not None and entry.platform == "utility_meter"
+    except Exception:
+        return False
+
+
 def _hash_panel_file(panel_path: str) -> str:
     """Compute a short cache-busting hash of the panel.js file."""
     with open(panel_path, "rb") as f:
@@ -827,6 +844,7 @@ async def _async_import_pair(
         "stats_detached": None,  # Detected restart-from-zero cliff, repairable on request
         "stats_unit_mismatch": None,  # Set when source and destination units differ
         "stats_unit": None,  # Unit of measurement for display
+        "dest_is_utility_meter": False,  # Display only: explains the History drop
         # Short-term statistics (5-minute) — populated only when fill_gaps=True
         "stats_short_source_total": 0,
         "stats_short_imported": 0,
@@ -915,6 +933,7 @@ async def _do_import(
 ) -> None:
     """Execute the actual import. Separated for clean lock/error handling."""
     recorder = get_instance(hass)
+    result["dest_is_utility_meter"] = _is_utility_meter(hass, dest_id)
 
     # --- 1. Read ALL source states ---
     # Use get_significant_states with significant_changes_only=False to capture
@@ -2612,8 +2631,8 @@ async def _async_import_statistics_for_pair(
             out["stats_sum_seeded"] = merged_sums[max(merged_sums)]
 
     if not to_import_rows:
-        if sum_offset is not None:
-            out["stats_sum_offset"] = sum_offset
+        # No offset is reported: with nothing imported, nothing is shifted, and
+        # the panel would otherwise announce an offset "would be applied".
         return out
 
     # -- Build StatisticData entries --

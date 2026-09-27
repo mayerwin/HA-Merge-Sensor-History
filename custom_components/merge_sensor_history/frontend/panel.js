@@ -1941,6 +1941,11 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             grid += `<span class="result-stat-error">Error: ${r.stats_short_error}</span>`;
         }
 
+        // --- Utility Meter destination: explain the drop in the History graph ---
+        if (r.dest_is_utility_meter) {
+          grid += `<span class="result-stat-range" style="grid-column:1/-1">&#8505;&#65039; <strong>The destination is a Utility Meter.</strong> A Utility Meter keeps its own running value inside the helper, counting from when it was created, and no import can change that value. The History graph can therefore show a drop where the imported history ends and the meter's own readings begin. That drop is in the meter's state only: the Energy dashboard reads statistics, not the meter's state, so it is not affected. Avoid lifting the meter with <strong>Utility Meter: Calibrate</strong> after importing: Home Assistant records the jump as consumption, which would count the imported history twice.</span>`;
+        }
+
         return `<div class="result-item result-success">
           <div class="result-header">
             <span class="result-icon">&#9989;</span>
