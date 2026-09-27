@@ -1146,17 +1146,22 @@ async def _do_import(
     # --- 5. Realign the destination series for a clean head-fill energy import ---
     # See the "series realignment" note in _async_import_statistics_for_pair.
     # Queued last so it runs on the recorder thread AFTER the import tasks commit,
-    # lifting every row (imported + existing + future) by the same constant. We
-    # skip it if short-term rows were imported this run, since a blanket lift would
-    # break the level of those recently gap-filled short-term slots — in that case
-    # the splice offset stays applied and we report it (with the first-hour caveat).
+    # lifting every row (imported + existing + future) by the same constant.
+    #
+    # This runs whatever the short-term step did. The lift starts at the oldest
+    # imported hour, so every row in both tables moves by the same amount and no
+    # two rows change relative to each other, gap-filled 5-minute slots included.
+    # Their level is right for the same reason: the realignment is only ever
+    # planned for a pure head-fill, where the destination's earliest hourly sum
+    # row and its earliest 5-minute sum row are the same instant, so both paths
+    # spliced against the same point with the same offset. Skipping the lift
+    # here used to leave the destination shifted down to meet the source, which
+    # made the lifetime total wrong for exactly the people re-running with
+    # Overwrite or Fill gaps after a bad import.
     realign = result.pop("_realign", None)
     if realign:
         original_offset = -float(realign["adjustment"])
-        if result.get("stats_short_imported", 0):
-            result["stats_realigned_by"] = None
-            result["stats_sum_offset"] = original_offset
-        elif dry_run:
+        if dry_run:
             # Preview: stats_realigned_by is already set for display ("would be
             # realigned"); skip the actual adjustment queueing.
             _LOGGER.info(
@@ -2656,10 +2661,11 @@ async def _async_import_statistics_for_pair(
     # the ENTIRE series — imported rows, the destination's existing rows, and all
     # future compiled rows — by -offset via HA's official adjust API. The oldest
     # hour then reads its true value and old/new join seamlessly. The adjust itself
-    # is queued in _do_import, after the imports, and only when no short-term rows
-    # were imported (a blanket lift could otherwise disrupt recently gap-filled
-    # short-term slots). A re-run recomputes a ~zero offset against the now-aligned
-    # destination, so this stays idempotent.
+    # is queued in _do_import, after the imports, and it runs whatever the
+    # short-term step did: both tables are spliced against the same instant in a
+    # head-fill, so one constant is right for both (see the note there). A re-run
+    # recomputes a ~zero offset against the now-aligned destination, so this
+    # stays idempotent.
     #
     # Restart-safe by construction (verified against HA's compile source): the lift
     # is a constant added to the `sum` column of both the short-term and long-term
