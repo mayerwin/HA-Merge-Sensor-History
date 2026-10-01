@@ -4,13 +4,27 @@
  * Provides a UI to select source/destination entity pairs
  * and import historical data between them.
  */
+
+/**
+ * What the panel was showing, kept for as long as the page stays open. Home
+ * Assistant throws a custom panel away when its browser tab has been hidden
+ * for 5 minutes, or when another page is opened, and builds a new one on the
+ * way back. The new panel picks up from here, including a run that was still
+ * going. Memory only: reloading the page starts afresh.
+ */
+const panelMemory = {
+  form: null, // the form as it was when the last panel was removed
+  run: null, // the import or preview still running, if any
+  outcome: null, // what the last finished run returned
+};
+
 class MergeSensorsHistoryPanel extends HTMLElement {
   constructor() {
     super();
     this._hass = null;
     this._pairs = [{ source: "", destination: "" }];
     this._importing = false;
-    this._results = null;
+    this._lastResults = null;
     this._debugByPair = new Map();
     // No-live-state entities: recorder statistics whose entity is gone from
     // the state machine — truly deleted (statistics only), disabled (recent
@@ -22,13 +36,33 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     this._deletedNames = new Map(); // id -> stored statistics name (may be "")
     this._deletedKinds = new Map(); // id -> "deleted" | "disabled" | "not loaded"
     this._deletedFetched = false;
+    // "Pick by device": two devices, and which destination entity each of the
+    // source device's entities goes to. The registry is read fresh each time
+    // the mode is switched on.
+    this._deviceMode = false;
+    this._devData = null; // { devices: Map(id -> device), entities: Map(device id -> [info]) }
+    this._devLoadError = "";
+    this._devSource = "";
+    this._devDest = "";
+    this._devChoices = {}; // source entity id -> destination entity id, "" to skip
+    this._devChoicesKey = ""; // the device pair _devChoices was made for
+    this._devSuggest = new Map(); // source entity id -> { dest, why }
+    // The filter fields serve both modes; each mode keeps its own text.
+    this._otherFilters = { single: "", source: "", dest: "" };
   }
 
   set hass(hass) {
     this._hass = hass;
     if (!this.shadowRoot) {
       this._render();
+      this._restore();
     }
+  }
+
+  disconnectedCallback() {
+    // Home Assistant removes the panel when its tab is hidden or another page
+    // is opened. Keep the form so the panel it builds next can show it again.
+    if (this.shadowRoot) panelMemory.form = this._snapshotForm();
   }
 
   set panel(panel) {
@@ -341,13 +375,47 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           color: var(--primary-text-color);
         }
         .result-error .result-icon { color: var(--error-color, #db4437); }
+        /* A preview writes nothing, so it must not look like a finished import. */
+        .result-preview {
+          background: color-mix(in srgb, var(--info-color, #039be5) 7%, transparent);
+          border: 1px dashed color-mix(in srgb, var(--info-color, #039be5) 65%, transparent);
+          color: var(--primary-text-color);
+        }
+        .result-preview .result-icon { color: var(--info-color, #039be5); }
+        .result-partial {
+          background: color-mix(in srgb, var(--warning-color, #ff9800) 10%, transparent);
+          border: 1px solid color-mix(in srgb, var(--warning-color, #ff9800) 35%, transparent);
+          color: var(--primary-text-color);
+        }
         .result-header {
           display: flex;
+          flex-wrap: wrap;
           align-items: center;
-          gap: 8px;
+          gap: 4px 8px;
           font-weight: 500;
           margin-bottom: 4px;
         }
+        .result-pair {
+          flex: 1 1 240px;
+          min-width: 0;
+          overflow-wrap: anywhere;
+        }
+        .result-badge {
+          flex-shrink: 0;
+          padding: 1px 8px;
+          border-radius: 10px;
+          font-size: 11px;
+          font-weight: 600;
+          letter-spacing: 0.5px;
+          text-transform: uppercase;
+          color: #fff;
+          white-space: nowrap;
+        }
+        .badge-preview { background: var(--info-color, #039be5); }
+        .badge-imported { background: var(--success-color, #4caf50); }
+        .badge-partial { background: var(--warning-color, #ff9800); }
+        .badge-nothing { background: var(--secondary-text-color, #727272); }
+        .badge-failed { background: var(--error-color, #db4437); }
         .result-icon {
           font-size: 18px;
         }
@@ -742,6 +810,99 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           line-height: 1.5;
         }
 
+        .device-note {
+          font-size: 13px;
+          color: var(--secondary-text-color);
+          margin-bottom: 14px;
+          line-height: 1.5;
+        }
+        .device-note.err {
+          color: var(--error-color, #db4437);
+        }
+        .map-table {
+          border: 1px solid var(--divider-color, #e0e0e0);
+          border-radius: 10px;
+          margin-bottom: 14px;
+          overflow: hidden;
+        }
+        .map-head,
+        .map-row {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) 24px minmax(0, 1fr);
+          gap: 4px 12px;
+          align-items: center;
+          padding: 9px 14px;
+        }
+        .map-head {
+          background: var(--secondary-background-color, #f5f5f5);
+          font-size: 11px;
+          font-weight: 600;
+          letter-spacing: 0.8px;
+          text-transform: uppercase;
+          color: var(--secondary-text-color);
+        }
+        .map-row {
+          border-top: 1px solid var(--divider-color, #e0e0e0);
+          font-size: 13px;
+        }
+        .map-row.skipped .map-src {
+          opacity: 0.55;
+        }
+        .map-name {
+          font-weight: 500;
+          overflow-wrap: anywhere;
+        }
+        .map-id,
+        .map-why {
+          font-size: 12px;
+          color: var(--secondary-text-color);
+          overflow-wrap: anywhere;
+        }
+        .map-arrow {
+          color: var(--primary-color, #03a9f4);
+          text-align: center;
+        }
+        .map-row select {
+          width: 100%;
+          padding: 7px 10px;
+          border: 1px solid var(--divider-color, #e0e0e0);
+          border-radius: 6px;
+          font-size: 13px;
+          background: var(--ha-card-background, var(--card-background-color, white));
+          color: var(--primary-text-color);
+          cursor: pointer;
+        }
+        .map-row select:focus {
+          outline: none;
+          border-color: var(--primary-color, #03a9f4);
+          box-shadow: 0 0 0 1px var(--primary-color, #03a9f4);
+        }
+        .map-unused {
+          border-top: 1px solid var(--divider-color, #e0e0e0);
+          padding: 9px 14px;
+          font-size: 12px;
+          color: var(--secondary-text-color);
+          overflow-wrap: anywhere;
+        }
+        .device-actions {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          flex-wrap: wrap;
+        }
+
+        @media (max-width: 600px) {
+          .map-head {
+            display: none;
+          }
+          .map-row {
+            grid-template-columns: minmax(0, 1fr);
+          }
+          .map-arrow {
+            text-align: left;
+          }
+        }
+
         @media (max-width: 600px) {
           .pair-row {
             flex-direction: column;
@@ -798,6 +959,11 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             <div id="bulk-error"></div>
           </div>
         </div>
+        <label class="deleted-toggle" id="device-toggle" title="Pick an old and a new device instead of single entities. Each entity of the old device is matched to one of the new device's, which you can change or skip, and the result is added to the list of pairs.">
+          <input type="checkbox" id="device-mode-cb" />
+          <span>Pick by device <span class="deleted-note">(match all of an old device's entities to a new one's)</span></span>
+          <span class="deleted-status" id="device-status"></span>
+        </label>
         <div class="filter-area">
           <div class="filter-row" id="single-filter-row">
             <span class="search-icon">&#128269;</span>
@@ -816,8 +982,9 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             Same filter for both
           </label>
         </div>
+        <div id="device-container" style="display:none"></div>
         <div id="pairs-container"></div>
-        <div class="pair-actions">
+        <div class="pair-actions" id="pair-actions">
           <button class="btn btn-secondary" id="add-pair-btn">+ Add Pair</button>
         </div>
         <div class="options-section">
@@ -895,10 +1062,24 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     this._deletedStatus = shadow.getElementById("deleted-status");
     this._overwriteCb = shadow.getElementById("overwrite-cb");
     this._overwriteNote = shadow.getElementById("overwrite-note");
+    this._deviceModeCb = shadow.getElementById("device-mode-cb");
+    this._deviceStatus = shadow.getElementById("device-status");
+    this._deviceContainer = shadow.getElementById("device-container");
+    this._pairActions = shadow.getElementById("pair-actions");
 
     this._showDeletedCb.addEventListener("change", () =>
       this._onShowDeletedChange()
     );
+
+    this._deviceModeCb.addEventListener("change", () =>
+      this._setDeviceMode(this._deviceModeCb.checked)
+    );
+    this._deviceContainer.addEventListener("change", (ev) =>
+      this._onDeviceChange(ev.target)
+    );
+    this._deviceContainer.addEventListener("click", (ev) => {
+      if (ev.target.closest("#device-add-btn")) this._addDevicePairs();
+    });
 
     // The full warning only unfolds once the box is ticked, so the panel stays
     // calm for the majority who never need this.
@@ -978,7 +1159,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       this._destFilterInput,
     ]) {
       el.addEventListener("input", () => {
-        this._renderPairs();
+        this._renderLists();
       });
     }
 
@@ -996,7 +1177,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         this._sourceFilterInput.value = this._filterInput.value;
         this._destFilterInput.value = this._filterInput.value;
       }
-      this._renderPairs();
+      this._renderLists();
     });
 
     shadow.getElementById("bulk-toggle").addEventListener("click", () => {
@@ -1250,6 +1431,608 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       row.appendChild(removeCol);
       container.appendChild(row);
     });
+  }
+
+  /** Re-render whichever list the current mode shows. */
+  _renderLists() {
+    if (this._deviceMode) this._renderDevices();
+    else this._renderPairs();
+  }
+
+  // --- Keeping the form when Home Assistant rebuilds the panel ---
+
+  _readFilters() {
+    return {
+      single: this._filterInput.value,
+      source: this._sourceFilterInput.value,
+      dest: this._destFilterInput.value,
+    };
+  }
+
+  _writeFilters(f) {
+    this._filterInput.value = f.single || "";
+    this._sourceFilterInput.value = f.source || "";
+    this._destFilterInput.value = f.dest || "";
+  }
+
+  /** Everything the user set up, as plain data. */
+  _snapshotForm() {
+    const current = this._readFilters();
+    return {
+      pairs: this._pairs.map((p) => ({ ...p })),
+      sharedFilter: this._sharedFilterCb.checked,
+      entityFilters: this._deviceMode ? { ...this._otherFilters } : current,
+      deviceFilters: this._deviceMode ? current : { ...this._otherFilters },
+      bulkText: this._bulkTextarea.value,
+      fillGaps: this._fillGapsCb.checked,
+      gapThreshold: this._gapThreshold.value,
+      scale: this._scaleCb.checked,
+      customMode: this._adjustModeCustom.checked,
+      scaleFactor: this._scaleFactor.value,
+      customFn: this._customFn.value,
+      overwrite: this._overwriteCb.checked,
+      showDeleted: this._showDeletedCb.checked,
+      deletedData: this._deletedFetched
+        ? {
+            ids: [...this._deletedIds],
+            names: [...this._deletedNames],
+            kinds: [...this._deletedKinds],
+          }
+        : null,
+      device: {
+        on: this._deviceMode,
+        source: this._devSource,
+        dest: this._devDest,
+        choices: { ...this._devChoices },
+        choicesKey: this._devChoicesKey,
+      },
+    };
+  }
+
+  /** Show what the previous panel was showing, and follow a run that is
+   *  still going. */
+  _restore() {
+    const f = panelMemory.form;
+    if (f) {
+      this._pairs = f.pairs.length
+        ? f.pairs.map((p) => ({ ...p }))
+        : [{ source: "", destination: "" }];
+      this._sharedFilterCb.checked = f.sharedFilter;
+      this._singleFilterRow.style.display = f.sharedFilter ? "" : "none";
+      this._sourceFilterRow.style.display = f.sharedFilter ? "none" : "";
+      this._destFilterRow.style.display = f.sharedFilter ? "none" : "";
+      this._writeFilters(f.entityFilters);
+      this._otherFilters = { ...f.deviceFilters };
+      this._bulkTextarea.value = f.bulkText;
+      this._fillGapsCb.checked = f.fillGaps;
+      this._gapThreshold.value = f.gapThreshold;
+      this._scaleCb.checked = f.scale;
+      this._adjustModeCustom.checked = f.customMode;
+      this._adjustModeMultiply.checked = !f.customMode;
+      this._scaleFactor.value = f.scaleFactor;
+      this._customFn.value = f.customFn;
+      this._overwriteCb.checked = f.overwrite;
+      // Runs the same enable/disable sync as a manual change.
+      for (const cb of [this._fillGapsCb, this._scaleCb, this._overwriteCb]) {
+        cb.dispatchEvent(new Event("change"));
+      }
+      if (f.deletedData) {
+        this._deletedIds = [...f.deletedData.ids];
+        this._deletedNames = new Map(f.deletedData.names);
+        this._deletedKinds = new Map(f.deletedData.kinds);
+        this._deletedFetched = true;
+      }
+      this._renderPairs();
+      if (f.showDeleted) {
+        this._showDeletedCb.checked = true;
+        this._onShowDeletedChange();
+      }
+      this._devSource = f.device.source;
+      this._devDest = f.device.dest;
+      this._devChoices = { ...f.device.choices };
+      this._devChoicesKey = f.device.choicesKey;
+      if (f.device.on) this._setDeviceMode(true);
+    }
+    if (panelMemory.run) this._followRun(panelMemory.run);
+    else if (panelMemory.outcome) this._showOutcome(panelMemory.outcome);
+  }
+
+  // --- Pick by device ---
+
+  _setDeviceMode(on) {
+    this._deviceModeCb.checked = on;
+    if (on === this._deviceMode) return;
+    this._deviceMode = on;
+    // Each mode keeps its own filter text: a device name typed here would
+    // otherwise hide most entities on the way back.
+    const current = this._readFilters();
+    this._writeFilters(this._otherFilters);
+    this._otherFilters = current;
+    const what = on ? "devices" : "entities";
+    this._filterInput.placeholder = on
+      ? "Filter devices by name, model or entity ID..."
+      : "Filter entities by name or ID...";
+    this._sourceFilterInput.placeholder = `Filter source ${what}...`;
+    this._destFilterInput.placeholder = `Filter destination ${what}...`;
+    this._deviceContainer.style.display = on ? "" : "none";
+    this._pairsContainer.style.display = on ? "none" : "";
+    this._pairActions.style.display = on ? "none" : "";
+    this._syncActionButtons();
+    if (on) {
+      this._loadDevices();
+    } else {
+      this._deviceStatus.textContent = "";
+      this._deviceStatus.classList.remove("err");
+      this._renderPairs();
+    }
+  }
+
+  /** Read the device and entity registries afresh, plus the statistics
+   *  metadata, which gives the unit of entities that have no live state. */
+  async _loadDevices() {
+    const token = (this._devLoadToken = (this._devLoadToken || 0) + 1);
+    this._devData = null;
+    this._devLoadError = "";
+    this._devSuggestKey = "";
+    this._deviceStatus.classList.remove("err");
+    this._deviceStatus.textContent = "loading…";
+    this._renderDevices();
+    try {
+      const [devices, entities, stats] = await Promise.all([
+        this._hass.callWS({ type: "config/device_registry/list" }),
+        this._hass.callWS({ type: "config/entity_registry/list" }),
+        this._hass
+          .callWS({ type: "recorder/list_statistic_ids" })
+          .catch(() => []),
+      ]);
+      if (token !== this._devLoadToken || !this._deviceMode) return;
+      this._devData = this._buildDeviceData(devices || [], entities || [], stats || []);
+      this._deviceStatus.textContent = this._devData.devices.size
+        ? ""
+        : "no devices with entities found";
+    } catch (err) {
+      if (token !== this._devLoadToken || !this._deviceMode) return;
+      this._devLoadError = String((err && err.message) || err);
+      this._deviceStatus.classList.add("err");
+      this._deviceStatus.textContent = "could not load";
+    }
+    this._renderDevices();
+  }
+
+  _buildDeviceData(devices, entities, stats) {
+    const meta = new Map();
+    for (const s of stats) if (s && s.statistic_id) meta.set(s.statistic_id, s);
+    const byDevice = new Map();
+    for (const e of entities) {
+      if (!e || !e.device_id || !e.entity_id) continue;
+      if (!byDevice.has(e.device_id)) byDevice.set(e.device_id, []);
+      byDevice.get(e.device_id).push(e);
+    }
+    const devMap = new Map();
+    const entMap = new Map();
+    for (const dev of devices) {
+      const regs = dev && byDevice.get(dev.id);
+      if (!regs) continue;
+      devMap.set(dev.id, dev);
+      entMap.set(
+        dev.id,
+        regs
+          .map((e) => this._entityInfo(e, dev, meta.get(e.entity_id)))
+          .sort(
+            (a, b) =>
+              (a.category ? 1 : 0) - (b.category ? 1 : 0) ||
+              a.label.localeCompare(b.label) ||
+              a.id.localeCompare(b.id)
+          )
+      );
+    }
+    return { devices: devMap, entities: entMap };
+  }
+
+  /** What the matching needs to know about one entity of a device. */
+  _entityInfo(reg, dev, meta) {
+    const id = reg.entity_id;
+    const st = this._hass.states[id];
+    const attrs = (st && st.attributes) || {};
+    // Names without the device's own name, which differs between the two.
+    const devNames = [dev.name_by_user, dev.name]
+      .map((n) => this._normName(n))
+      .filter(Boolean);
+    const strip = (n) => {
+      for (const p of devNames) {
+        if (n === p) return "";
+        if (n.startsWith(p + " ")) return n.slice(p.length + 1);
+      }
+      return n;
+    };
+    const stripped = [attrs.friendly_name, reg.name, reg.original_name, id.split(".")[1]]
+      .filter((n) => typeof n === "string" && n)
+      .map((n) => strip(this._normName(n)));
+    let label = attrs.friendly_name || reg.name || reg.original_name || "";
+    for (const p of [dev.name_by_user, dev.name]) {
+      if (p && label.toLowerCase().startsWith(p.toLowerCase() + " ")) {
+        label = label.slice(p.length + 1);
+        break;
+      }
+    }
+    let hasSum = null;
+    if (meta && typeof meta.has_sum === "boolean") hasSum = meta.has_sum;
+    else if (attrs.state_class)
+      hasSum = attrs.state_class === "total" || attrs.state_class === "total_increasing";
+    let unit = null; // null: not known
+    if (st) unit = attrs.unit_of_measurement || "";
+    else if (meta) unit = meta.statistics_unit_of_measurement || "";
+    return {
+      id,
+      domain: id.split(".")[0],
+      label: label || id,
+      disabled: !!reg.disabled_by,
+      category: reg.entity_category || null,
+      tk: reg.translation_key || null,
+      names: [...new Set(stripped.filter(Boolean))],
+      main: stripped.includes(""), // named after the device only
+      deviceClass: attrs.device_class || null,
+      unit,
+      unitClass: (meta && meta.unit_class) || null,
+      hasSum,
+    };
+  }
+
+  _normName(s) {
+    return String(s || "")
+      .normalize("NFKD")
+      .replace(/[̀-ͯ]/g, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  }
+
+  /** Whether two entities could hold the same kind of data. A pair that
+   *  fails this is never suggested, however alike the names. */
+  _kindsCompatible(a, b) {
+    if (a.domain !== b.domain) return false;
+    if (a.deviceClass && b.deviceClass && a.deviceClass !== b.deviceClass) return false;
+    if (a.hasSum !== null && b.hasSum !== null && a.hasSum !== b.hasSum) return false;
+    if (a.unitClass && b.unitClass) return a.unitClass === b.unitClass;
+    if (a.unit !== null && b.unit !== null) return a.unit === b.unit;
+    return true;
+  }
+
+  _editDistance(a, b) {
+    let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+    for (let i = 1; i <= a.length; i++) {
+      const cur = [i];
+      for (let j = 1; j <= b.length; j++) {
+        cur[j] = Math.min(
+          prev[j] + 1,
+          cur[j - 1] + 1,
+          prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+        );
+      }
+      prev = cur;
+    }
+    return prev[b.length];
+  }
+
+  /** How alike two normalized names are, from 0 to 1. */
+  _nameSim(a, b) {
+    if (a === b) return 1;
+    const ta = new Set(a.split(" "));
+    const tb = new Set(b.split(" "));
+    let shared = 0;
+    for (const t of ta) if (tb.has(t)) shared++;
+    const jaccard = shared / (ta.size + tb.size - shared);
+    // "Power" in "Active power" is a hint, not a match: "Temperature" is also
+    // in "Device temperature".
+    const contained = shared > 0 && shared === Math.min(ta.size, tb.size) ? 0.6 : 0;
+    const edit = 1 - this._editDistance(a, b) / Math.max(a.length, b.length);
+    return Math.max(jaccard, contained, edit);
+  }
+
+  /** The best likeness between two entities' names, and whether their names
+   *  only ever disagree on a number: "Voltage L1" and "Voltage L2", or two
+   *  channels, are different things however alike the rest is. */
+  _namesSim(s, d) {
+    const nums = (n) =>
+      n
+        .split(" ")
+        .filter((x) => /\d/.test(x))
+        .sort()
+        .join(" ");
+    let sim = s.main && d.main ? 0.9 : 0;
+    let numbersDiffer = s.names.length > 0 && d.names.length > 0;
+    for (const a of s.names) {
+      for (const b of d.names) {
+        const na = nums(a);
+        const nb = nums(b);
+        if (na && nb && na !== nb) continue;
+        numbersDiffer = false;
+        sim = Math.max(sim, this._nameSim(a, b));
+      }
+    }
+    return { sim, numbersDiffer };
+  }
+
+  /** Suggest which of the new device's entities each old one goes to. Only
+   *  pairs of the same kind are considered, scored on the integration's own
+   *  type key, the name without the device's, and being the only one of a
+   *  kind on both devices. A pair is suggested only when it clears the bar
+   *  and no equally good rival exists: an unclear case is left to the user
+   *  rather than guessed. Returns Map(source id -> { dest, why }). */
+  _suggestMatches(src, dst) {
+    const kind = (e) =>
+      e.deviceClass
+        ? [e.domain, e.deviceClass, e.unitClass || e.unit || "", e.hasSum].join("|")
+        : null;
+    const countKinds = (list) => {
+      const m = new Map();
+      for (const e of list) {
+        const k = kind(e);
+        if (k) m.set(k, (m.get(k) || 0) + 1);
+      }
+      return m;
+    };
+    const srcKinds = countKinds(src);
+    const dstKinds = countKinds(dst);
+    const cands = [];
+    for (const s of src) {
+      for (const d of dst) {
+        if (!this._kindsCompatible(s, d)) continue;
+        const { sim, numbersDiffer } = this._namesSim(s, d);
+        if (numbersDiffer) continue;
+        const sameType = !!s.tk && s.tk === d.tk;
+        const k = kind(s);
+        const onlyOne =
+          !!k && k === kind(d) && srcKinds.get(k) === 1 && dstKinds.get(k) === 1;
+        let score = 60 * sim + (sameType ? 100 : 0) + (onlyOne ? 40 : 0);
+        if (s.deviceClass && s.deviceClass === d.deviceClass) score += 5;
+        if (s.unit && s.unit === d.unit) score += 3;
+        if (score < 45) continue;
+        let why = "similar name";
+        if (sameType) why = "same type of entity";
+        else if (sim >= 1) why = "same name";
+        else if (s.main && d.main && sim === 0.9) why = "the device's main entity on both";
+        else if (sim < 0.75 && onlyOne) why = "the only one of its kind on both devices";
+        cands.push({ s: s.id, d: d.id, score, why });
+      }
+    }
+    cands.sort(
+      (a, b) => b.score - a.score || a.s.localeCompare(b.s) || a.d.localeCompare(b.d)
+    );
+    const takenS = new Set(); // matched, or left to the user
+    const takenD = new Set();
+    const out = new Map();
+    for (let i = 0; i < cands.length; ) {
+      let j = i;
+      while (j < cands.length && cands[i].score - cands[j].score < 1e-6) j++;
+      const group = cands
+        .slice(i, j)
+        .filter((c) => !takenS.has(c.s) && !takenD.has(c.d));
+      const perS = new Map();
+      const perD = new Map();
+      for (const c of group) {
+        perS.set(c.s, (perS.get(c.s) || 0) + 1);
+        perD.set(c.d, (perD.get(c.d) || 0) + 1);
+      }
+      for (const c of group) {
+        if (takenS.has(c.s) || takenD.has(c.d)) continue;
+        const tieS = perS.get(c.s) > 1;
+        const tieD = perD.get(c.d) > 1;
+        if (tieS || tieD) {
+          if (tieS) takenS.add(c.s);
+          if (tieD) takenD.add(c.d);
+          continue;
+        }
+        takenS.add(c.s);
+        takenD.add(c.d);
+        out.set(c.s, { dest: c.d, why: c.why });
+      }
+      i = j;
+    }
+    return out;
+  }
+
+  _deviceName(dev) {
+    return dev.name_by_user || dev.name || dev.id;
+  }
+
+  _deviceLabel(dev) {
+    const model = [dev.manufacturer, dev.model].filter(Boolean).join(" ");
+    let label = this._deviceName(dev) + (model ? ` (${model})` : "");
+    if (dev.disabled_by) label += " [disabled]";
+    return this._esc(label);
+  }
+
+  _getFilteredDevices(role) {
+    const shared = this._sharedFilterCb.checked;
+    const input = shared
+      ? this._filterInput
+      : role === "destination"
+        ? this._destFilterInput
+        : this._sourceFilterInput;
+    const filter = (input.value || "").trim().toLowerCase();
+    const matches = (dev) =>
+      [dev.name_by_user, dev.name, dev.manufacturer, dev.model, dev.id].some(
+        (s) => s && String(s).toLowerCase().includes(filter)
+      ) ||
+      (this._devData.entities.get(dev.id) || []).some(
+        (e) => e.id.includes(filter) || e.label.toLowerCase().includes(filter)
+      );
+    return [...this._devData.devices.values()]
+      .filter((dev) => !filter || matches(dev))
+      .sort((a, b) => this._deviceName(a).localeCompare(this._deviceName(b)));
+  }
+
+  _buildDeviceOptions(devs, selected) {
+    let opts = '<option value="">-- Select device --</option>';
+    const sel = selected && this._devData.devices.get(selected);
+    if (sel && !devs.includes(sel)) {
+      opts += `<option value="${this._esc(sel.id)}" selected>${this._deviceLabel(sel)} [filtered]</option>`;
+    }
+    for (const dev of devs) {
+      opts += `<option value="${this._esc(dev.id)}"${dev.id === selected ? " selected" : ""}>${this._deviceLabel(dev)}</option>`;
+    }
+    return opts;
+  }
+
+  _renderDevices() {
+    const c = this._deviceContainer;
+    if (!this._devData) {
+      c.innerHTML = this._devLoadError
+        ? `<div class="device-note err">The device list could not be loaded: ${this._esc(this._devLoadError)}</div>`
+        : `<div class="device-note">Loading devices…</div>`;
+      return;
+    }
+    // A device removed since leaves nothing to pick.
+    if (!this._devData.devices.has(this._devSource)) this._devSource = "";
+    if (!this._devData.devices.has(this._devDest)) this._devDest = "";
+    const col = (role, label, selected) => {
+      const n = selected ? (this._devData.entities.get(selected) || []).length : 0;
+      return `<div class="entity-col">
+          <label>${label}</label>
+          <select data-device-role="${role}">${this._buildDeviceOptions(this._getFilteredDevices(role), selected)}</select>
+          <div class="entity-info">${n ? `${n} entit${n === 1 ? "y" : "ies"}` : ""}</div>
+        </div>`;
+    };
+    c.innerHTML = `<div class="pair-row">
+        ${col("source", "Source device (old)", this._devSource)}
+        <div class="arrow-col">&#8594;</div>
+        ${col("destination", "Destination device (new)", this._devDest)}
+      </div>
+      ${this._mappingHtml()}`;
+    this._updateMappingSummary();
+  }
+
+  _mappingHtml() {
+    if (!this._devSource || !this._devDest) {
+      return `<div class="device-note">Pick the old device and the new one. Each of the old device's entities is then matched to one of the new device's, for you to check before adding them to the list of pairs.</div>`;
+    }
+    if (this._devSource === this._devDest) {
+      return `<div class="device-note err">Pick two different devices.</div>`;
+    }
+    const src = this._devData.entities.get(this._devSource) || [];
+    const dst = this._devData.entities.get(this._devDest) || [];
+    const key = `${this._devSource}\n${this._devDest}`;
+    if (this._devSuggestKey !== key) {
+      this._devSuggest = this._suggestMatches(src, dst);
+      this._devSuggestKey = key;
+    }
+    // A new pair of devices starts from the suggestions; the same pair keeps
+    // the user's own choices.
+    if (this._devChoicesKey !== key) {
+      this._devChoices = {};
+      this._devChoicesKey = key;
+    }
+    const dstIds = new Set(dst.map((d) => d.id));
+    for (const s of src) {
+      const choice = this._devChoices[s.id];
+      if (choice === undefined) {
+        const sug = this._devSuggest.get(s.id);
+        this._devChoices[s.id] = sug ? sug.dest : "";
+      } else if (choice && !dstIds.has(choice)) {
+        this._devChoices[s.id] = "";
+      }
+    }
+    const rows = src.map((s) => this._mapRowHtml(s, dst)).join("");
+    return `<div class="map-table">
+        <div class="map-head"><span>Old device's entity</span><span></span><span>Gets its history into</span></div>
+        ${rows}
+        <div class="map-unused" id="map-unused"></div>
+      </div>
+      <div class="device-actions">
+        <button class="btn btn-primary" id="device-add-btn">Add pairs</button>
+        <span class="device-note" style="margin:0">Adds them to the list of pairs, where Preview and Import work as usual.</span>
+      </div>`;
+  }
+
+  _mapRowHtml(s, dst) {
+    const choice = this._devChoices[s.id] || "";
+    let opts = '<option value="">Skip (not imported)</option>';
+    for (const d of dst) {
+      const label = `${d.label} (${d.id})${d.disabled ? " [disabled]" : ""}`;
+      opts += `<option value="${this._esc(d.id)}"${d.id === choice ? " selected" : ""}>${this._esc(label)}</option>`;
+    }
+    const idLine = s.category ? `${s.id} · ${s.category}` : s.id;
+    return `<div class="map-row${choice ? "" : " skipped"}">
+        <div class="map-src">
+          <div class="map-name">${this._esc(s.label)}${s.disabled ? " [disabled]" : ""}</div>
+          <div class="map-id">${this._esc(idLine)}</div>
+        </div>
+        <div class="map-arrow">&#8594;</div>
+        <div>
+          <select data-map-src="${this._esc(s.id)}">${opts}</select>
+          <div class="map-why">${this._esc(this._whyText(s.id, choice))}</div>
+        </div>
+      </div>`;
+  }
+
+  _whyText(srcId, choice) {
+    const sug = this._devSuggest.get(srcId);
+    if (sug && sug.dest === choice) return `Suggested: ${sug.why}`;
+    if (!sug && !choice) return "No clear match: pick one, or leave it skipped";
+    return "";
+  }
+
+  _chosenPairs() {
+    const src = this._devData.entities.get(this._devSource) || [];
+    return src
+      .filter((s) => this._devChoices[s.id])
+      .map((s) => ({ source: s.id, destination: this._devChoices[s.id] }));
+  }
+
+  _updateMappingSummary() {
+    const btn = this._deviceContainer.querySelector("#device-add-btn");
+    if (!btn) return;
+    const n = this._chosenPairs().length;
+    btn.textContent = n === 1 ? "Add 1 pair" : `Add ${n} pairs`;
+    btn.disabled = n === 0;
+    const dst = this._devData.entities.get(this._devDest) || [];
+    const used = new Set(Object.values(this._devChoices).filter(Boolean));
+    const unused = dst.filter((d) => !used.has(d.id));
+    this._deviceContainer.querySelector("#map-unused").textContent = unused.length
+      ? `New device's entities left without history: ${unused.map((d) => d.label).join(", ")}`
+      : "Every entity of the new device gets history.";
+  }
+
+  _onDeviceChange(el) {
+    if (el.dataset.deviceRole) {
+      if (el.dataset.deviceRole === "source") this._devSource = el.value;
+      else this._devDest = el.value;
+      this._renderDevices();
+      return;
+    }
+    const srcId = el.dataset.mapSrc;
+    if (!srcId) return;
+    this._devChoices[srcId] = el.value;
+    const row = el.closest(".map-row");
+    row.classList.toggle("skipped", !el.value);
+    row.querySelector(".map-why").textContent = this._whyText(srcId, el.value);
+    this._updateMappingSummary();
+  }
+
+  /** Turn the device mapping into ordinary pairs and go back to the list. */
+  _addDevicePairs() {
+    const add = this._chosenPairs();
+    if (!add.length) return;
+    if (this._pairs.length === 1 && !this._pairs[0].source && !this._pairs[0].destination) {
+      this._pairs = [];
+    }
+    const have = new Set(this._pairs.map((p) => `${p.source}\n${p.destination}`));
+    for (const p of add) {
+      if (!have.has(`${p.source}\n${p.destination}`)) this._pairs.push(p);
+    }
+    this._setDeviceMode(false);
+    // A disabled entity has no live state, so the dropdowns list it only with
+    // "Show deleted/disabled entities" on.
+    const live = this._hass.states;
+    const isLive = (id) => Object.prototype.hasOwnProperty.call(live, id);
+    if (
+      !this._showDeletedCb.checked &&
+      add.some((p) => !isLive(p.source) || !isLive(p.destination))
+    ) {
+      this._showDeletedCb.checked = true;
+      this._onShowDeletedChange();
+    }
   }
 
   /** Strip invisible/non-printable characters and normalize whitespace. */
@@ -1604,18 +2387,13 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       }
     }
 
-    this._importing = true;
-    this._importBtn.disabled = true;
-    this._previewBtn.disabled = true;
-    if (dryRun) {
-      this._previewBtn.innerHTML = '<span class="spinner"></span>Analyzing\u2026';
-    } else {
-      this._importBtn.innerHTML = '<span class="spinner"></span>Importing\u2026';
-    }
     this._resultsContainer.innerHTML = "";
-
-    try {
-      const response = await this._hass.callWS({
+    panelMemory.outcome = null;
+    // The run is kept in panelMemory, not on this panel: if Home Assistant
+    // rebuilds the panel meanwhile, the new one follows the same run.
+    const run = { dryRun, outcome: null };
+    run.done = this._hass
+      .callWS({
         type: "merge_sensor_history/import",
         pairs: validPairs,
         fill_gaps: fillGaps,
@@ -1624,25 +2402,69 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         overwrite: overwrite,
         scale_factor: scaleFactor,
         value_function: valueFunction,
+      })
+      .then(
+        (response) => ({ dryRun, results: response.results }),
+        (err) => ({ dryRun, error: String((err && err.message) || err) })
+      )
+      .then((outcome) => {
+        run.outcome = outcome;
+        if (panelMemory.run === run) {
+          panelMemory.run = null;
+          panelMemory.outcome = outcome;
+        }
       });
+    panelMemory.run = run;
+    await this._followRun(run);
+  }
 
-      this._renderResults(response.results);
-    } catch (err) {
-      this._resultsContainer.innerHTML = `
-        <div class="result-item result-error">
-          <div class="result-header">
-            <span class="result-icon">&#10060;</span>
-            ${dryRun ? "Analysis" : "Import"} failed
-          </div>
-          <div class="result-details">${err.message || err}</div>
-        </div>`;
-    } finally {
-      this._importing = false;
-      this._importBtn.disabled = false;
-      this._previewBtn.disabled = false;
-      this._importBtn.textContent = "Import History";
-      this._previewBtn.textContent = "Preview";
+  /** Show a run as busy until it ends, then show what it returned. */
+  async _followRun(run) {
+    this._importing = true;
+    const btn = run.dryRun ? this._previewBtn : this._importBtn;
+    btn.innerHTML = `<span class="spinner"></span>${run.dryRun ? "Analyzing" : "Importing"}\u2026`;
+    this._syncActionButtons();
+    await run.done;
+    this._importing = false;
+    this._importBtn.textContent = "Import History";
+    this._previewBtn.textContent = "Preview";
+    this._syncActionButtons();
+    this._showOutcome(run.outcome);
+  }
+
+  /** Preview and Import are off while a run is going, and in device mode,
+   *  whose pairs are not in the list yet. */
+  _syncActionButtons() {
+    const off = this._importing || this._deviceMode;
+    this._importBtn.disabled = off;
+    this._previewBtn.disabled = off;
+  }
+
+  _showOutcome(outcome) {
+    if (!outcome) return;
+    if (outcome.error === undefined) {
+      try {
+        this._renderResults(outcome.results);
+      } catch (err) {
+        this._resultsContainer.innerHTML = `
+          <div class="result-item result-error">
+            <div class="result-details">The ${outcome.dryRun ? "preview" : "import"} finished, but its results could not be shown: ${this._esc((err && err.message) || err)}</div>
+          </div>`;
+      }
+      return;
     }
+    const badge = outcome.dryRun
+      ? '<span class="result-badge badge-preview">Preview</span>'
+      : '<span class="result-badge badge-failed">Failed</span>';
+    this._resultsContainer.innerHTML = `
+      <div class="result-item result-error">
+        <div class="result-header">
+          <span class="result-icon">&#10060;</span>
+          ${badge}
+          <span class="result-pair">${outcome.dryRun ? "Preview" : "Import"} failed</span>
+        </div>
+        <div class="result-details">${this._esc(outcome.error)}</div>
+      </div>`;
   }
 
   /** The rest of the units-differ warning: the usual conversion between the
@@ -1723,10 +2545,18 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       ${
         r.dry_run
           ? `<em>Run the import to get the option to repair this. A preview never writes anything.</em>`
-          : `<button class="repair-btn" data-statistic-id="${dest}">Repair running total</button>
+          : r.stats_detached_repaired
+            ? `<div class="repair-outcome">${this._repairDoneHtml(r.stats_detached_repaired)}</div>`
+            : `<button class="repair-btn" data-statistic-id="${dest}">Repair running total</button>
              <div class="repair-outcome"></div>`
       }
     </div>`;
+  }
+
+  _repairDoneHtml(res) {
+    const liftStr = this._esc(this._formatOffset(res.lift, res.unit));
+    const when = this._esc(this._formatTs(res.start));
+    return `✅ Running total repaired: every row from ${when} onwards was lifted by <strong>${liftStr}</strong>. The Energy dashboard may take a few minutes to catch up.`;
   }
 
   async _repairSumSeries(btn) {
@@ -1740,10 +2570,13 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         statistic_id: statisticId,
       });
       if (res.repaired) {
-        const liftStr = this._esc(this._formatOffset(res.lift, res.unit));
-        const when = this._esc(this._formatTs(res.start));
-        outcome.innerHTML = `✅ Running total repaired: every row from ${when} onwards was lifted by <strong>${liftStr}</strong>. The Energy dashboard may take a few minutes to catch up.`;
+        outcome.innerHTML = this._repairDoneHtml(res);
         btn.remove();
+        // Remembered on the result, so a rebuilt panel shows it as done.
+        const done = { lift: res.lift, start: res.start, unit: res.unit };
+        for (const r of this._lastResults || []) {
+          if (r.destination === statisticId) r.stats_detached_repaired = done;
+        }
       } else {
         outcome.textContent = res.reason || "Nothing to repair.";
         btn.disabled = false;
@@ -1817,7 +2650,53 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     return unit ? `${sign}${formatted} ${unit}` : `${sign}${formatted}`;
   }
 
+  /** The top line of a result card. A preview gets its own look and badge so
+   *  it cannot be mistaken for a finished import. */
+  _resultHeader(r, pairLabel) {
+    let icon = "&#9989;";
+    let badge;
+    if (r.dry_run) {
+      if (!r.error) icon = "&#128269;";
+      badge = `<span class="result-badge badge-preview" title="A preview writes nothing. Click Import History to run it for real.">Preview</span>`;
+    } else if (r.error) {
+      badge = `<span class="result-badge badge-failed">Failed</span>`;
+    } else if (this._partlyFailed(r)) {
+      icon = "&#9888;&#65039;";
+      badge = `<span class="result-badge badge-partial">Imported with errors</span>`;
+    } else if (
+      !r.states_imported &&
+      !r.stats_imported &&
+      !r.stats_short_imported
+    ) {
+      badge = `<span class="result-badge badge-nothing">Nothing to import</span>`;
+    } else {
+      badge = `<span class="result-badge badge-imported">Imported</span>`;
+    }
+    if (r.error) icon = "&#10060;";
+    return `<div class="result-header">
+        <span class="result-icon">${icon}</span>
+        ${badge}
+        <span class="result-pair">${pairLabel}</span>
+      </div>`;
+  }
+
+  _partlyFailed(r) {
+    return !!(
+      r.stats_error ||
+      r.stats_short_error ||
+      r.stats_seed_error ||
+      r.stats_realign_error
+    );
+  }
+
+  _resultCardClass(r) {
+    if (r.error) return "result-error";
+    if (r.dry_run) return "result-preview";
+    return this._partlyFailed(r) ? "result-partial" : "result-success";
+  }
+
   _renderResults(results) {
+    this._lastResults = results;
     this._debugByPair.clear();
     results.forEach((r, i) => {
       this._debugByPair.set(`${i}`, {
@@ -1835,7 +2714,9 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         const dstName = this._esc(this._friendlyName(r.destination));
         const srcLabel = srcName ? `${r.source} (${srcName})` : r.source;
         const dstLabel = dstName ? `${r.destination} (${dstName})` : r.destination;
-        const pairLabel = (r.dry_run ? "Preview: " : "") + `${srcLabel} \u2192 ${dstLabel}`;
+        const pairLabel = `${srcLabel} \u2192 ${dstLabel}`;
+        const header = this._resultHeader(r, pairLabel);
+        const cardClass = this._resultCardClass(r);
         const actionVerb = r.dry_run ? "would be imported" : "imported";
         const pairKey = `${i}`;
 
@@ -1848,10 +2729,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             ? "This was a preview only, so nothing was written."
             : "The import was rolled back, so nothing was written and the database is unchanged. Re-run it once the cause is resolved.";
           return `<div class="result-item result-error">
-            <div class="result-header">
-              <span class="result-icon">&#10060;</span>
-              ${pairLabel}
-            </div>
+            ${header}
             <div class="result-details">
               ${r.error}<br/>
               <em>${aftermath}</em>
@@ -1872,11 +2750,8 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           (r.stats_short_source_total || 0) === 0;
 
         if (nothingImported && noSourceData) {
-          return `<div class="result-item result-success">
-            <div class="result-header">
-              <span class="result-icon">&#9989;</span>
-              ${pairLabel}
-            </div>
+          return `<div class="result-item ${cardClass}">
+            ${header}
             <div class="result-details">No source data found &mdash; nothing to import.</div>
           </div>`;
         }
@@ -2024,11 +2899,8 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           grid += `<span class="result-stat-range" style="grid-column:1/-1">&#8505;&#65039; <strong>The destination is a Utility Meter.</strong> A Utility Meter keeps its own running value inside the helper, counting from when it was created, and no import can change that value. The History graph can therefore show a drop where the imported history ends and the meter's own readings begin. That drop is in the meter's state only: the Energy dashboard reads statistics, not the meter's state, so it is not affected. Avoid lifting the meter with <strong>Utility Meter: Calibrate</strong> after importing: Home Assistant records the jump as consumption, which would count the imported history twice.</span>`;
         }
 
-        return `<div class="result-item result-success">
-          <div class="result-header">
-            <span class="result-icon">&#9989;</span>
-            ${pairLabel}
-          </div>
+        return `<div class="result-item ${cardClass}">
+          ${header}
           <div class="result-stat-grid">${grid}</div>
         </div>`;
       })
