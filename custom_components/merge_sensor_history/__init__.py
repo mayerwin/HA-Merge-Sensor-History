@@ -66,6 +66,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.service import async_register_admin_service
 
 from .const import DOMAIN
 
@@ -602,7 +603,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 result.get("states_overwritten", 0),
             )
 
-    hass.services.async_register(
+    # Admin-only, like the panel and its websocket commands: an import writes to
+    # (and with overwrite, deletes from) the recorder database, so a non-admin
+    # user must not be able to call it through the API either.
+    async_register_admin_service(
+        hass,
         DOMAIN,
         "import_history",
         handle_import_history,

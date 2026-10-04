@@ -55,6 +55,8 @@ HA does **not** regenerate statistics from states retroactively. Both are import
 2. Search for **Merge Sensor History**
 3. Click Submit — this enables the integration and adds the sidebar panel
 
+The **Merge History** panel is shown only to administrators. Users without admin rights do not see it in their sidebar, cannot open it by its URL, and cannot run an import through the service or the API either.
+
 ## Usage
 
 ### Sidebar panel
@@ -93,7 +95,7 @@ Also available on the service call as `overwrite: true`.
 
 ### Service call
 
-You can also call the service directly from Developer Tools or automations:
+You can also call the service directly from Developer Tools or automations. A call made by a user is accepted only from an administrator:
 
 ```yaml
 service: merge_sensor_history.import_history
