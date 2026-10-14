@@ -39,10 +39,8 @@ HA does **not** regenerate statistics from states retroactively. Both are import
 ### HACS (recommended)
 
 1. Open HACS in your Home Assistant instance
-2. Click the three dots in the top right corner, select **Custom repositories**
-3. Add `https://github.com/mayerwin/HA-Merge-Sensor-History` as an **Integration**
-4. Search for "Merge Sensor History" and install it
-5. Restart Home Assistant
+2. Search for "Merge Sensor History" and install it
+3. Restart Home Assistant
 
 ### Manual
 
