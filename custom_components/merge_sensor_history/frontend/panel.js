@@ -2043,7 +2043,19 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     return raw.replace(/[^\x09\x20-\x7E]/g, "").trim();
   }
 
-  _handleBulkAdd() {
+  async _handleBulkAdd() {
+    // The deleted-ids lookup below awaits; a second click meanwhile would add
+    // the same pairs twice.
+    if (this._bulkBusy) return;
+    this._bulkBusy = true;
+    try {
+      await this._bulkAdd();
+    } finally {
+      this._bulkBusy = false;
+    }
+  }
+
+  async _bulkAdd() {
     const text = this._bulkTextarea.value.trim();
     this._bulkError.innerHTML = "";
 
@@ -2052,12 +2064,8 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       return;
     }
 
-    // Valid ids = live entities, plus deleted (orphaned-stats) ids when the
-    // "Show deleted/disabled entities" toggle is on.
-    const knownEntities = new Set(this._allEntityIds());
     const parsed = [];
     const parseErrors = [];
-    const invalidIds = new Set();
 
     const lines = text.split(/\r?\n/);
     for (let i = 0; i < lines.length; i++) {
@@ -2078,8 +2086,6 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       }
 
       const [source, destination] = parts;
-      if (!knownEntities.has(source)) invalidIds.add(source);
-      if (!knownEntities.has(destination)) invalidIds.add(destination);
       parsed.push({ source, destination });
     }
 
@@ -2088,9 +2094,39 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       return;
     }
 
+    // Valid ids = live entities, plus deleted/disabled ids when the
+    // "Show deleted/disabled entities" toggle is on.
+    const unknownIds = () => {
+      const known = new Set(this._allEntityIds());
+      const ids = new Set();
+      for (const p of parsed) {
+        if (!known.has(p.source)) ids.add(p.source);
+        if (!known.has(p.destination)) ids.add(p.destination);
+      }
+      return ids;
+    };
+    let invalidIds = unknownIds();
+
+    // Pasting the ids of a renamed or removed sensor is the main use of Bulk
+    // add, so look them up among the deleted/disabled ones before giving up,
+    // and keep the toggle on if that resolves them (the dropdowns need it to
+    // show them).
+    if (invalidIds.size > 0 && !this._showDeletedCb.checked) {
+      this._showDeletedCb.checked = true;
+      await this._onShowDeletedChange();
+      invalidIds = unknownIds();
+      if (invalidIds.size > 0 && this._showDeletedCb.checked) {
+        this._showDeletedCb.checked = false;
+        await this._onShowDeletedChange();
+      }
+    }
+
     if (invalidIds.size > 0) {
       const list = [...invalidIds].map((id) => `<code>${id}</code>`).join(", ");
-      this._bulkError.innerHTML = `<div class="bulk-error"><strong>Unknown entity IDs:</strong> ${list}<br/>No pairs were added. Please fix the IDs and try again.</div>`;
+      const why = this._deletedFetched
+        ? "These are neither current entities nor deleted or disabled ones Home Assistant still has data for."
+        : "Deleted and disabled entities could not be looked up (see next to <strong>Show deleted/disabled entities</strong>).";
+      this._bulkError.innerHTML = `<div class="bulk-error"><strong>Unknown entity IDs:</strong> ${list}<br/>${why} No pairs were added. Please check the IDs and try again.</div>`;
       return;
     }
 
