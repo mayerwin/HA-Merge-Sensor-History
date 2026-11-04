@@ -761,6 +761,21 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           border-color: var(--primary-color, #03a9f4);
           box-shadow: 0 0 0 1px var(--primary-color, #03a9f4);
         }
+        .option-row select {
+          padding: 6px 10px;
+          border: 1px solid var(--divider-color, #e0e0e0);
+          border-radius: 6px;
+          font-size: 13px;
+          background: var(--ha-card-background, var(--card-background-color, white));
+          color: var(--primary-text-color);
+          box-sizing: border-box;
+          cursor: pointer;
+        }
+        .option-row select:focus {
+          outline: none;
+          border-color: var(--primary-color, #03a9f4);
+          box-shadow: 0 0 0 1px var(--primary-color, #03a9f4);
+        }
         .option-row input[type="text"] {
           flex: 1;
           min-width: 160px;
@@ -1014,6 +1029,15 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             <span class="option-hint" id="custom-fn-preview"></span>
             <span class="option-hint">&mdash; a math formula of <strong>v</strong> (the source value), evaluated safely (never as JavaScript). Allowed: numbers, + - * / % ^ ( ) and abs, round, floor, ceil, sqrt, log, log10, exp, min, max, pow, pi, e. Applied to states and statistics; energy totals are spliced after conversion; non-numeric states pass through. For cumulative (energy-style) sensors keep the formula linear, like a*v + b, so hourly deltas stay correct.</span>
           </div>
+          <div class="option-row sub-row" id="adjust-target-row">
+            <span class="option-label">Apply multiplier to:</span>
+            <select id="adjust-target">
+              <option value="both" selected>Both (states and long-term statistics)</option>
+              <option value="long-term statistics">Long-term statistics</option>
+              <option value="state">State</option>
+            </select>
+            <span class="option-hint">&mdash; choose which historical records have the multiplier applied</span>
+          </div>
           <label class="option-row danger" style="margin-top:14px" title="Replaces the destination's data with the source's wherever the source has data, instead of only filling holes. Destination state rows inside the source's time span are deleted. This cannot be undone without a database backup.">
             <input type="checkbox" id="overwrite-cb" />
             <span class="option-label">&#9888;&#65039; Overwrite existing destination data (destructive)</span>
@@ -1054,6 +1078,8 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     this._scaleFactor = shadow.getElementById("scale-factor");
     this._adjustMultiplyRow = shadow.getElementById("adjust-multiply-row");
     this._adjustCustomRow = shadow.getElementById("adjust-custom-row");
+    this._adjustTargetRow = shadow.getElementById("adjust-target-row");
+    this._adjustTarget = shadow.getElementById("adjust-target");
     this._adjustModeMultiply = shadow.getElementById("adjust-mode-multiply");
     this._adjustModeCustom = shadow.getElementById("adjust-mode-custom");
     this._customFn = shadow.getElementById("custom-fn");
@@ -1133,8 +1159,10 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       const multiply = this._adjustModeMultiply.checked;
       this._adjustMultiplyRow.classList.toggle("disabled", !on);
       this._adjustCustomRow.classList.toggle("disabled", !on);
+      this._adjustTargetRow.classList.toggle("disabled", !on);
       this._adjustModeMultiply.disabled = !on;
       this._adjustModeCustom.disabled = !on;
+      this._adjustTarget.disabled = !on;
       this._scaleFactor.disabled = !on || !multiply;
       this._customFn.disabled = !on || multiply;
       updateFnPreview();
@@ -1467,6 +1495,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       fillGaps: this._fillGapsCb.checked,
       gapThreshold: this._gapThreshold.value,
       scale: this._scaleCb.checked,
+      adjustTarget: this._adjustTarget ? this._adjustTarget.value : "both",
       customMode: this._adjustModeCustom.checked,
       scaleFactor: this._scaleFactor.value,
       customFn: this._customFn.value,
@@ -1507,6 +1536,9 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       this._fillGapsCb.checked = f.fillGaps;
       this._gapThreshold.value = f.gapThreshold;
       this._scaleCb.checked = f.scale;
+      if (this._adjustTarget && f.adjustTarget) {
+        this._adjustTarget.value = f.adjustTarget;
+      }
       this._adjustModeCustom.checked = f.customMode;
       this._adjustModeMultiply.checked = !f.customMode;
       this._scaleFactor.value = f.scaleFactor;
@@ -2349,7 +2381,9 @@ class MergeSensorsHistoryPanel extends HTMLElement {
     const scaleEnabled = this._scaleCb.checked;
     let scaleFactor = null;
     let valueFunction = null;
+    let applyMultiplierTo = "both";
     if (scaleEnabled) {
+      applyMultiplierTo = this._adjustTarget ? this._adjustTarget.value : "both";
       if (this._adjustModeCustom.checked) {
         valueFunction = this._customFn.value.trim();
         try {
@@ -2385,10 +2419,17 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         : "";
 
       let scaleLine = "";
+      const targetDesc =
+        applyMultiplierTo === "long-term statistics"
+          ? "applied to long-term statistics only"
+          : applyMultiplierTo === "state"
+            ? "applied to state history only"
+            : "applied to both states and statistics";
+
       if (valueFunction) {
-        scaleLine = `\n\nCustom function: f(v) = ${valueFunction} (applied to every imported value)`;
+        scaleLine = `\n\nCustom function: f(v) = ${valueFunction} (${targetDesc})`;
       } else if (scaleFactor !== null && scaleFactor !== 1) {
-        scaleLine = `\n\nScaling factor: \u00d7${scaleFactor} (every imported value is multiplied)`;
+        scaleLine = `\n\nScaling factor: \u00d7${scaleFactor} (${targetDesc})`;
       }
 
       if (
@@ -2438,6 +2479,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         overwrite: overwrite,
         scale_factor: scaleFactor,
         value_function: valueFunction,
+        apply_multiplier_to: applyMultiplierTo,
       })
       .then(
         (response) => ({ dryRun, results: response.results }),
@@ -2539,6 +2581,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
   _applyUnitSuggestion(btn) {
     const { scale, fn } = btn.dataset;
     this._scaleCb.checked = true;
+    if (this._adjustTarget) this._adjustTarget.value = "both";
     if (fn) {
       this._adjustModeCustom.checked = true;
       this._customFn.value = fn;
@@ -2810,14 +2853,21 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         }
 
         // --- Value adjustment notice ---
+        const targetLabel =
+          r.apply_multiplier_to === "long-term statistics"
+            ? "numeric long-term statistics only"
+            : r.apply_multiplier_to === "state"
+              ? "numeric state history only"
+              : "every numeric source value (states and statistics)";
+
         if (r.value_function) {
           const esc = String(r.value_function)
             .replace(/&/g, "&amp;")
             .replace(/</g, "&lt;")
             .replace(/>/g, "&gt;");
-          grid += `<span class="result-stat-range" style="grid-column:1/-1">Custom function ${r.dry_run ? "to be applied" : "applied"}: <strong>f(v) = ${esc}</strong> &mdash; every numeric source value ${r.dry_run ? "will be" : "was"} converted before import.</span>`;
+          grid += `<span class="result-stat-range" style="grid-column:1/-1">Custom function ${r.dry_run ? "to be applied" : "applied"}: <strong>f(v) = ${esc}</strong> &mdash; ${targetLabel} ${r.dry_run ? "will be" : "was"} converted before import.</span>`;
         } else if (r.scale_factor !== null && r.scale_factor !== undefined) {
-          grid += `<span class="result-stat-range" style="grid-column:1/-1">Scaling factor ${r.dry_run ? "to be applied" : "applied"}: <strong>&times;${r.scale_factor}</strong> &mdash; every numeric source value ${r.dry_run ? "will be" : "was"} multiplied before import.</span>`;
+          grid += `<span class="result-stat-range" style="grid-column:1/-1">Scaling factor ${r.dry_run ? "to be applied" : "applied"}: <strong>&times;${r.scale_factor}</strong> &mdash; ${targetLabel} ${r.dry_run ? "will be" : "was"} multiplied before import.</span>`;
         }
 
         // --- States summary ---

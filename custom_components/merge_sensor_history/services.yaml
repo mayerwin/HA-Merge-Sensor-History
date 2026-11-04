@@ -57,3 +57,20 @@ import_history:
       example: "v * 9/5 + 32"
       selector:
         text:
+    apply_multiplier_to:
+      name: Apply Multiplier To
+      description: "Choose which values to apply the scaling factor or value function to. Options: both (default, applies to states and long-term statistics), long-term statistics, or state."
+      required: false
+      default: "both"
+      example: "both"
+      selector:
+        select:
+          options:
+            - label: "Both"
+              value: "both"
+            - label: "Long-term statistics"
+              value: "long-term statistics"
+            - label: "State"
+              value: "state"
+
+

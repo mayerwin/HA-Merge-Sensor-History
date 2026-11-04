@@ -286,6 +286,31 @@ def _build_transform(
     return None
 
 
+VALID_APPLY_MULTIPLIER_TARGETS = (
+    "both",
+    "long-term statistics",
+    "long_term_statistics",
+    "statistics",
+    "state",
+    "states",
+)
+
+
+def _normalize_apply_multiplier_to(val: str | None) -> str:
+    """Normalize the target selection for multiplier/transform application.
+
+    Returns one of: 'both', 'long-term statistics', 'state'.
+    """
+    if not val:
+        return "both"
+    v = str(val).strip().lower().replace("-", "_").replace(" ", "_")
+    if v in ("long_term_statistics", "statistics", "lts", "stat", "stats"):
+        return "long-term statistics"
+    if v in ("state", "states"):
+        return "state"
+    return "both"
+
+
 def _scale_state_value(
     value: str | None, transform: Callable[[float], float]
 ) -> str | None:
@@ -576,6 +601,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if scale_factor is not None and scale_factor == 1.0:
             scale_factor = None
         value_function = call.data.get("value_function")
+        apply_multiplier_to = call.data.get("apply_multiplier_to", "both")
         overwrite = bool(call.data.get("overwrite", False))
         result = await _async_import_pair(
             hass,
@@ -585,6 +611,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             gap_threshold_minutes=gap_threshold_minutes,
             scale_factor=scale_factor,
             value_function=value_function,
+            apply_multiplier_to=apply_multiplier_to,
             overwrite=overwrite,
         )
         if result["error"]:
@@ -625,6 +652,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 ),
                 vol.Optional("value_function"): vol.All(
                     cv.string, vol.Length(min=1, max=_VALUE_FUNCTION_MAX_LEN)
+                ),
+                vol.Optional("apply_multiplier_to", default="both"): vol.All(
+                    cv.string, vol.In(VALID_APPLY_MULTIPLIER_TARGETS)
                 ),
             }
         ),
@@ -687,6 +717,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             None,
             vol.All(cv.string, vol.Length(min=1, max=_VALUE_FUNCTION_MAX_LEN)),
         ),
+        vol.Optional("apply_multiplier_to", default="both"): vol.Any(
+            None, vol.In(VALID_APPLY_MULTIPLIER_TARGETS)
+        ),
     }
 )
 @websocket_api.async_response
@@ -701,6 +734,7 @@ async def ws_import_history(
     overwrite = bool(msg.get("overwrite", False))
     scale_factor = msg.get("scale_factor")
     value_function = msg.get("value_function")
+    apply_multiplier_to = msg.get("apply_multiplier_to", "both")
     # A factor of exactly 1 is a no-op — treat it as disabled.
     if scale_factor is not None and scale_factor == 1.0:
         scale_factor = None
@@ -716,6 +750,7 @@ async def ws_import_history(
             dry_run=dry_run,
             scale_factor=scale_factor,
             value_function=value_function,
+            apply_multiplier_to=apply_multiplier_to,
             overwrite=overwrite,
         )
         results.append(
@@ -815,6 +850,7 @@ async def _async_import_pair(
     dry_run: bool = False,
     scale_factor: float | None = None,
     value_function: str | None = None,
+    apply_multiplier_to: str = "both",
     overwrite: bool = False,
 ) -> dict[str, Any]:
     """Import all history from source entity into destination entity.
@@ -865,11 +901,16 @@ async def _async_import_pair(
     cumulative-sum splice offset is computed, so energy series join correctly
     in the destination's value space.
 
+    `apply_multiplier_to` specifies which records receive the value adjustment:
+    'both' (default), 'long-term statistics', or 'state'.
+
     Returns a dict with result details for the UI.
     """
+    norm_apply_to = _normalize_apply_multiplier_to(apply_multiplier_to)
     result: dict[str, Any] = {
         "scale_factor": scale_factor,  # echoed for display (None = off)
         "value_function": value_function,  # echoed for display (None = off)
+        "apply_multiplier_to": norm_apply_to,  # echoed for display
         "overwrite": overwrite,  # echoed for display
         # States
         "states_source_total": 0,
@@ -932,6 +973,13 @@ async def _async_import_pair(
         result["error"] = str(exc)
         return result
 
+    transform_states = (
+        transform if norm_apply_to in ("both", "state") else None
+    )
+    transform_stats = (
+        transform if norm_apply_to in ("both", "long-term statistics") else None
+    )
+
     # --- Per-destination lock to prevent concurrent imports ---
     locks: dict[str, asyncio.Lock] = hass.data[DOMAIN]["_locks"]
     if dest_id not in locks:
@@ -958,7 +1006,8 @@ async def _async_import_pair(
                 fill_gaps=fill_gaps,
                 gap_threshold_minutes=gap_threshold_minutes,
                 dry_run=dry_run,
-                transform=transform,
+                transform_states=transform_states,
+                transform_stats=transform_stats,
                 overwrite=overwrite,
                 cancel_event=cancel_event,
             )
@@ -985,7 +1034,8 @@ async def _do_import(
     fill_gaps: bool = False,
     gap_threshold_minutes: int = 60,
     dry_run: bool = False,
-    transform: Callable[[float], float] | None = None,
+    transform_states: Callable[[float], float] | None = None,
+    transform_stats: Callable[[float], float] | None = None,
     overwrite: bool = False,
     cancel_event: threading.Event | None = None,
 ) -> None:
@@ -1048,7 +1098,7 @@ async def _do_import(
             fill_gaps=fill_gaps,
             gap_threshold_minutes=gap_threshold_minutes,
             dry_run=dry_run,
-            transform=transform,
+            transform=transform_states,
             overwrite=overwrite,
         )
         result["states_imported"] = states_out["inserted"]
@@ -1106,7 +1156,7 @@ async def _do_import(
             source_id,
             dest_id,
             dry_run=dry_run,
-            transform=transform,
+            transform=transform_stats,
             overwrite=overwrite,
         )
         result.update(stats_result)
@@ -1135,7 +1185,7 @@ async def _do_import(
                 dest_id,
                 gap_threshold_minutes=gap_threshold_minutes,
                 dry_run=dry_run,
-                transform=transform,
+                transform=transform_stats,
                 overwrite=overwrite,
             )
             result.update(short_result)
