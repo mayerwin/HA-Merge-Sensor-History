@@ -373,28 +373,21 @@ def _unit_class_for(unit: str | None) -> str | None:
     return converter.UNIT_CLASS if converter is not None else None
 
 
-def _format_number(value: float) -> str:
-    """A factor as a person would type it: 1000, 0.001, 1.8."""
-    return f"{value:.12g}"
-
-
-def _suggest_unit_adjustment(
+def _unit_conversion(
     from_unit: str | None,
     to_unit: str | None,
     declared_classes: tuple[str | None, ...] = (),
-) -> dict[str, Any] | None:
-    """The value adjustment that converts `from_unit` into `to_unit`, or None.
+) -> Callable[[float], float] | None:
+    """Home Assistant's own conversion from `from_unit` to `to_unit`, or None.
 
-    Only a suggestion for the panel to offer: nothing is applied unless the
-    user fills it in, and they can change it. Offered only when both units
-    belong to the same Home Assistant converter, and when no `unit_class`
-    recorded in either sensor's metadata names a different class (HA's
-    unit-keyed map resolves a unit to one class even where it is shared, such
-    as temperature and temperature difference, which convert differently).
-
-    Returns {"scale_factor": a} for a plain factor, {"value_function": ...}
-    when the conversion also has an offset (temperature), or None.
+    Only when both units belong to the same Home Assistant converter (kWh and
+    Wh, °C and °F, ...), and when no `unit_class` recorded in either sensor's
+    statistics metadata names a different class: HA's unit-keyed map resolves
+    a unit to one class even where it is shared, such as temperature and
+    temperature difference, which convert differently.
     """
+    if from_unit == to_unit:
+        return None
     try:
         converter = STATISTIC_UNIT_TO_UNIT_CONVERTER.get(from_unit)
         if (
@@ -407,23 +400,97 @@ def _suggest_unit_adjustment(
             return None
         if any(c is not None and c != converter.UNIT_CLASS for c in declared_classes):
             return None
-        offset = float(converter.convert(0.0, from_unit, to_unit))
-        factor = float(converter.convert(1.0, from_unit, to_unit)) - offset
-        check = float(converter.convert(1000.0, from_unit, to_unit))
+        # Probe it once, so a converter that cannot handle the pair is caught
+        # here rather than halfway through an import.
+        if not math.isfinite(float(converter.convert(1.0, from_unit, to_unit))):
+            return None
     except Exception:
         return None
-    if not all(math.isfinite(x) for x in (offset, factor, check)) or factor <= 0:
-        return None
-    # Only a straight line can be expressed as an adjustment.
-    if abs(check - (factor * 1000.0 + offset)) > 1e-9 * max(1.0, abs(check)):
-        return None
-    if abs(offset) < 1e-12:
-        if abs(factor - 1.0) < 1e-12:
-            return None
-        return {"scale_factor": float(_format_number(factor))}
-    sign = "+" if offset > 0 else "-"
-    scaled = "v" if abs(factor - 1.0) < 1e-12 else f"v * {_format_number(factor)}"
-    return {"value_function": f"{scaled} {sign} {_format_number(abs(offset))}"}
+    return lambda v: float(converter.convert(v, from_unit, to_unit))
+
+
+class _ConvertedState:
+    """A source state whose value was converted to the destination's unit.
+
+    Carries just what the state import reads, plus the original value and unit
+    for the per-row debug records.
+    """
+
+    __slots__ = (
+        "entity_id",
+        "state",
+        "attributes",
+        "last_changed",
+        "last_updated",
+        "last_reported",
+        "converted_from",
+    )
+
+    def __init__(self, src: Any, value: str, attributes: dict, from_unit: str) -> None:
+        self.entity_id = src.entity_id
+        self.state = value
+        self.attributes = attributes
+        self.last_changed = src.last_changed
+        self.last_updated = src.last_updated
+        self.last_reported = getattr(src, "last_reported", None)
+        self.converted_from = f"{src.state} {from_unit}"
+
+
+def _convert_state_units(
+    source_states: list,
+    to_unit: str | None,
+    declared_classes: tuple[str | None, ...],
+) -> tuple[list, dict[str, int]]:
+    """Convert each source state into `to_unit`, from the unit on that row.
+
+    A state records the unit its sensor reported at the time, so a sensor
+    whose unit changed holds rows in both units, and statistics, whose unit is
+    fixed when they are first recorded, can be in yet another one. Each row is
+    therefore converted on its own, and its `unit_of_measurement` attribute
+    rewritten to match. Rows with no unit, a non-numeric value, or a unit Home
+    Assistant cannot convert are kept as they are.
+
+    Returns the states and a count of converted rows per original unit.
+    """
+    converted: dict[str, int] = {}
+    if not to_unit:
+        return source_states, converted
+    convs: dict[str, Callable[[float], float] | None] = {}
+    out = []
+    for s in source_states:
+        attrs = s.attributes or {}
+        unit = attrs.get("unit_of_measurement")
+        if not unit or unit == to_unit:
+            out.append(s)
+            continue
+        if unit not in convs:
+            convs[unit] = _unit_conversion(unit, to_unit, declared_classes)
+        conv = convs[unit]
+        if conv is None:
+            out.append(s)
+            continue
+        new_attrs = dict(attrs)
+        new_attrs["unit_of_measurement"] = to_unit
+        if _is_numeric_state(s.state):
+            new_val = _scale_state_value(str(s.state), conv)
+            converted[unit] = converted.get(unit, 0) + 1
+            out.append(_ConvertedState(s, new_val, new_attrs, unit))
+        else:
+            # unavailable/unknown or text: nothing to convert, but the unit
+            # attribute still follows the destination.
+            conv_state = _ConvertedState(s, s.state, new_attrs, unit)
+            conv_state.converted_from = None
+            out.append(conv_state)
+    return out, converted
+
+
+def _is_numeric_state(value: Any) -> bool:
+    if value is None or value in _NON_GOOD_STATES:
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (ValueError, TypeError):
+        return False
 
 
 def _ensure_unit_class(metadata: dict[str, Any]) -> None:
@@ -854,16 +921,21 @@ async def _async_import_pair(
       commissioning, or an earlier import made with the wrong unit). Deleted
       state rows are not recoverable without a database backup.
 
+    Units are converted automatically with Home Assistant's own converters:
+    statistics from the source's stored statistics unit to the destination's,
+    and each raw state from the unit recorded on that row to the unit the
+    destination reports now. The two are handled separately because they can
+    differ: a statistics unit is fixed when first compiled, while states
+    follow whatever the sensor reports at the time.
+
     When `scale_factor` is set (a positive float), every numeric value read
     from the source (state strings and statistics mean/min/max/sum/state) is
-    multiplied by it before being considered for import — for merging sensors
-    that record the same quantity in different units (e.g. 1000 for kWh -> Wh,
-    0.001 for Wh -> kWh). `value_function` is the general form: a restricted
-    math formula of `v` (see _compile_value_function) for conversions a plain
-    factor can't express, e.g. "v * 9/5 + 32" for °C -> °F. The two are
-    mutually exclusive. Either way the conversion happens before the
-    cumulative-sum splice offset is computed, so energy series join correctly
-    in the destination's value space.
+    then multiplied by it, for corrections that are not a unit change.
+    `value_function` is the general form: a restricted math formula of `v`
+    (see _compile_value_function). The two are mutually exclusive. Either way
+    the adjustment happens before the cumulative-sum splice offset is
+    computed, so energy series join correctly in the destination's value
+    space.
 
     Returns a dict with result details for the UI.
     """
@@ -900,7 +972,9 @@ async def _async_import_pair(
         "stats_realigned_by": None,  # Amount the dest running total was lifted (or None)
         "stats_sum_seeded": None,  # Running total seeded for the destination's future rows
         "stats_detached": None,  # Detected restart-from-zero cliff, repairable on request
-        "stats_unit_mismatch": None,  # Set when source and destination units differ
+        "stats_unit_mismatch": None,  # Set when the units differ and cannot be converted
+        "stats_unit_converted": None,  # Set when statistics were converted between units
+        "states_unit_converted": None,  # {"destination": unit, "from": {unit: rows converted}}
         "stats_unit": None,  # Unit of measurement for display
         "dest_is_utility_meter": False,  # Display only: explains the History drop
         # Short-term statistics (5-minute) — populated only when fill_gaps=True
@@ -1033,6 +1107,38 @@ async def _do_import(
             source_states[0].last_updated.isoformat(),
             source_states[-1].last_updated.isoformat(),
         )
+
+        # --- 1b. Convert each state to the destination's unit ---
+        # The destination's states are recorded in the unit it reports now.
+        # Without a live state (disabled, not loaded), its statistics' stored
+        # unit is the best guess available.
+        stats_meta = await recorder.async_add_executor_job(
+            partial(get_metadata, hass, statistic_ids={source_id, dest_id})
+        )
+        source_meta = (stats_meta.get(source_id) or (None, {}))[1]
+        dest_meta = (stats_meta.get(dest_id) or (None, {}))[1]
+        dest_state = hass.states.get(dest_id)
+        dest_state_unit = (
+            dest_state.attributes.get("unit_of_measurement")
+            if dest_state
+            else dest_meta.get("unit_of_measurement")
+        )
+        source_states, converted = _convert_state_units(
+            source_states,
+            dest_state_unit,
+            (source_meta.get("unit_class"), dest_meta.get("unit_class")),
+        )
+        if converted:
+            result["states_unit_converted"] = {
+                "destination": dest_state_unit,
+                "from": converted,
+            }
+            _LOGGER.info(
+                "Converting source states of %s to %s: %s",
+                source_id,
+                dest_state_unit,
+                ", ".join(f"{n} in {u}" for u, n in converted.items()),
+            )
 
         # --- 2. Insert states in a single transaction ---
         # All-or-nothing, at any size. It runs on the recorder's own thread so
@@ -1545,6 +1651,7 @@ def _insert_states(
                     "ts": s.last_updated.isoformat(),
                     "ts_epoch": s.last_updated.timestamp(),
                     "source_value": src_val,
+                    "converted_from": getattr(s, "converted_from", None),
                     "dest_has_row_at_same_ts": None,
                     "prev_dest_good_ts": None,
                     "next_dest_good_ts": None,
@@ -1579,6 +1686,7 @@ def _insert_states(
                     "ts": s.last_updated.isoformat(),
                     "ts_epoch": s.last_updated.timestamp(),
                     "source_value": src_val,
+                    "converted_from": getattr(s, "converted_from", None),
                     "dest_has_row_at_same_ts": False,
                     "prev_dest_good_ts": None,
                     "next_dest_good_ts": None,
@@ -1658,6 +1766,7 @@ def _insert_states(
                     "ts": s.last_updated.isoformat(),
                     "ts_epoch": ts,
                     "source_value": src_val,
+                    "converted_from": getattr(s, "converted_from", None),
                     "dest_has_row_at_same_ts": ts in dest_ts_set
                     or ts in head_dedup_ts,
                 }
@@ -2402,6 +2511,7 @@ async def _async_import_statistics_for_pair(
         "stats_detached": None,
         "stats_unit": None,
         "stats_unit_mismatch": None,
+        "stats_unit_converted": None,
         "debug_stats": [],
     }
 
@@ -2432,21 +2542,29 @@ async def _async_import_statistics_for_pair(
         )
     )
     out["stats_unit"] = target["unit"]
-    if target["units_differ"]:
-        # Not converted for you: a factor can mean a unit change or something
-        # else entirely, and silently guessing would double up with any
-        # adjustment already set, and would disagree with the raw-state import,
-        # which has no unit handling of its own.
+    if target["convert"] is not None:
+        out["stats_unit_converted"] = {
+            "source": target["source_unit"],
+            "destination": target["unit"],
+        }
+        _LOGGER.info(
+            "Source %s stores its statistics in %s and the destination %s in "
+            "%s: converting them",
+            source_id,
+            target["source_unit"],
+            dest_id,
+            target["unit"],
+        )
+    elif target["units_differ"]:
         out["stats_unit_mismatch"] = {
             "source": target["source_unit"],
             "destination": target["unit"],
-            # Offered in the panel for the user to fill in; never applied here.
-            "suggestion": target["suggestion"],
         }
         _LOGGER.warning(
             "Source %s stores its statistics in %s but the destination %s "
-            "stores %s. The values are imported exactly as stored; use the "
-            "value adjustment option if they need scaling",
+            "stores %s, and Home Assistant has no conversion between them. "
+            "The values are imported exactly as stored; use the value "
+            "adjustment option if they need scaling",
             source_id,
             target["source_unit"],
             dest_id,
@@ -2497,11 +2615,13 @@ async def _async_import_statistics_for_pair(
         # repairing that does not need the source at all.
         return out
 
-    # -- Apply the user's value adjustment BEFORE any splice math --
+    # -- Convert units, then apply the user's value adjustment, BEFORE any
+    # splice math --
     # The sum offset and column merges below must operate in the destination's
-    # value space, so the source rows are adjusted first. This is the only
-    # thing that rescales values, for statistics and raw states alike, which
-    # is what keeps the two halves of an import consistent with each other.
+    # value space, so the source rows are converted first. The unit conversion
+    # comes from the statistics' own stored unit; raw states are converted
+    # separately from the unit recorded on each row, since the two can differ.
+    source_rows = _scale_stat_rows(source_rows, target["convert"])
     source_rows = _scale_stat_rows(source_rows, transform)
 
     source_has_sum_values = any(r.get("sum") is not None for r in source_rows)
@@ -3092,8 +3212,10 @@ def _fetch_period_snapshot(
         "unit": target_unit,
         "source_unit": source_unit,
         "units_differ": units_differ,
-        "suggestion": (
-            _suggest_unit_adjustment(
+        # Home Assistant's conversion between the two, applied to the source
+        # rows before anything else; None when they cannot be converted.
+        "convert": (
+            _unit_conversion(
                 source_unit,
                 target_unit,
                 (
@@ -3183,7 +3305,9 @@ async def _async_import_short_term_statistics_for_pair(
     if not source_rows:
         return out
 
-    # -- Apply the unit scaling factor BEFORE any splice math (see LTS path) --
+    # -- Convert units and apply the adjustment BEFORE any splice math (see
+    # LTS path) --
+    source_rows = _scale_stat_rows(source_rows, target["convert"])
     source_rows = _scale_stat_rows(source_rows, transform)
 
     # -- Reuse LTS splice-offset logic (works identically on 5-min rows) --

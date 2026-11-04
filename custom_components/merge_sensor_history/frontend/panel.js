@@ -484,25 +484,6 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           opacity: 0.6;
           cursor: default;
         }
-        .suggest-btn {
-          margin-top: 6px;
-          padding: 4px 10px;
-          border-radius: 4px;
-          border: 1px solid var(--primary-color, #03a9f4);
-          background: var(--primary-color, #03a9f4);
-          color: #fff;
-          font-size: 13px;
-          font-style: normal;
-          cursor: pointer;
-        }
-        .suggest-btn:disabled {
-          opacity: 0.6;
-          cursor: default;
-        }
-        .suggest-outcome {
-          color: var(--primary-text-color);
-          font-style: normal;
-        }
         .repair-outcome {
           margin-top: 8px;
           font-size: 13px;
@@ -999,20 +980,20 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             <span class="option-unit">minutes</span>
             <span class="option-hint">&mdash; a gap is any period this long where the destination has no state but the source does</span>
           </div>
-          <label class="option-row" style="margin-top:14px" title="Convert every numeric value read from the source (states and statistics) before importing. Use when the two sensors record the same quantity in different units.">
+          <label class="option-row" style="margin-top:14px" title="Change every numeric value read from the source (states and statistics) before importing. Units Home Assistant knows how to convert (kWh and Wh, °C and °F, ...) are converted for you without this; use it for anything else, such as a sensor that reported the wrong scale.">
             <input type="checkbox" id="scale-cb" />
             <span class="option-label">Adjust imported values</span>
           </label>
           <div class="option-row sub-row" id="adjust-multiply-row">
             <label class="adjust-mode-label"><input type="radio" name="adjust-mode" id="adjust-mode-multiply" checked /> Multiply by:</label>
             <input type="number" id="scale-factor" step="any" min="0" value="1000" />
-            <span class="option-hint">&mdash; e.g. 1000 for kWh &rarr; Wh, or 0.001 for Wh &rarr; kWh</span>
+            <span class="option-hint">&mdash; not needed for a unit change Home Assistant knows (kWh &rarr; Wh is converted for you)</span>
           </div>
           <div class="option-row sub-row" id="adjust-custom-row">
             <label class="adjust-mode-label"><input type="radio" name="adjust-mode" id="adjust-mode-custom" /> Custom function:</label>
             <input type="text" id="custom-fn" placeholder="v * 9/5 + 32" spellcheck="false" autocomplete="off" />
             <span class="option-hint" id="custom-fn-preview"></span>
-            <span class="option-hint">&mdash; a math formula of <strong>v</strong> (the source value), evaluated safely (never as JavaScript). Allowed: numbers, + - * / % ^ ( ) and abs, round, floor, ceil, sqrt, log, log10, exp, min, max, pow, pi, e. Applied to states and statistics; energy totals are spliced after conversion; non-numeric states pass through. For cumulative (energy-style) sensors keep the formula linear, like a*v + b, so hourly deltas stay correct.</span>
+            <span class="option-hint">&mdash; a math formula of <strong>v</strong> (the source value), evaluated safely (never as JavaScript). Allowed: numbers, + - * / % ^ ( ) and abs, round, floor, ceil, sqrt, log, log10, exp, min, max, pow, pi, e. Applied to states and statistics, after any automatic unit conversion; energy totals are spliced after it; non-numeric states pass through. For cumulative (energy-style) sensors keep the formula linear, like a*v + b, so hourly deltas stay correct.</span>
           </div>
           <label class="option-row danger" style="margin-top:14px" title="Replaces the destination's data with the source's wherever the source has data, instead of only filling holes. Destination state rows inside the source's time span are deleted. This cannot be undone without a database backup.">
             <input type="checkbox" id="overwrite-cb" />
@@ -1193,11 +1174,6 @@ class MergeSensorsHistoryPanel extends HTMLElement {
       const repairBtn = ev.target.closest(".repair-btn");
       if (repairBtn) {
         this._repairSumSeries(repairBtn);
-        return;
-      }
-      const suggestBtn = ev.target.closest(".suggest-btn");
-      if (suggestBtn) {
-        this._applyUnitSuggestion(suggestBtn);
         return;
       }
       const btn = ev.target.closest(".debug-dl-btn");
@@ -2362,7 +2338,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         scaleFactor = parseFloat(this._scaleFactor.value);
         if (!Number.isFinite(scaleFactor) || scaleFactor <= 0) {
           alert(
-            "Scaling factor must be a positive number (e.g. 1000 for kWh \u2192 Wh, 0.001 for Wh \u2192 kWh)."
+            "Scaling factor must be a positive number."
           );
           return;
         }
@@ -2501,60 +2477,6 @@ class MergeSensorsHistoryPanel extends HTMLElement {
         </div>
         <div class="result-details">${this._esc(outcome.error)}</div>
       </div>`;
-  }
-
-  /** The rest of the units-differ warning: the usual conversion between the
-   *  two units, with a button that fills it in under Options. Only ever a
-   *  suggestion: nothing is applied until the user runs the import with it,
-   *  and they can change it first. */
-  _unitSuggestion(r, pairCount) {
-    const sug = r.stats_unit_mismatch && r.stats_unit_mismatch.suggestion;
-    const setNow = r.scale_factor || r.value_function;
-    if (!sug) {
-      return `If they need scaling, enable <strong>Adjust imported values</strong> under Options${setNow ? " (already set for this run)" : ""}.`;
-    }
-    const isFn = !!sug.value_function;
-    const label = isFn
-      ? `f(v) = ${this._esc(sug.value_function)}`
-      : `&times;${this._esc(String(sug.scale_factor))}`;
-    let text = `The usual conversion is <strong>${label}</strong>.`;
-    const matches = isFn
-      ? r.value_function === sug.value_function
-      : !r.value_function && Number(r.scale_factor) === Number(sug.scale_factor);
-    if (matches) {
-      return `${text} <strong>Adjust imported values</strong> ${r.dry_run ? "is" : "was"} already set to this for this run.`;
-    }
-    if (setNow) text += ` <strong>Adjust imported values</strong> ${r.dry_run ? "is" : "was"} set to something else for this run.`;
-    if (pairCount > 1) {
-      return `${text} <strong>Adjust imported values</strong> applies to every pair in a run, so import this pair on its own to use it.`;
-    }
-    const data = isFn
-      ? `data-fn="${this._esc(sug.value_function)}"`
-      : `data-scale="${this._esc(String(sug.scale_factor))}"`;
-    return `${text}<br/><button class="suggest-btn" ${data}>Use ${label}</button>
-      <span class="suggest-outcome"></span>`;
-  }
-
-  /** Fill a suggested conversion in under Options, exactly as if typed. */
-  _applyUnitSuggestion(btn) {
-    const { scale, fn } = btn.dataset;
-    this._scaleCb.checked = true;
-    if (fn) {
-      this._adjustModeCustom.checked = true;
-      this._customFn.value = fn;
-    } else {
-      this._adjustModeMultiply.checked = true;
-      this._scaleFactor.value = scale;
-    }
-    // Runs the same enable/disable and live-preview sync as a manual change.
-    this._scaleCb.dispatchEvent(new Event("change"));
-    btn.disabled = true;
-    const outcome = btn.parentElement.querySelector(".suggest-outcome");
-    if (outcome) {
-      outcome.textContent =
-        " Filled in under Options. Check it, then run Preview again before importing.";
-    }
-    this._scaleCb.scrollIntoView({ behavior: "smooth", block: "center" });
   }
 
   /** Explain a destination whose running total restarted from zero, and offer
@@ -2851,6 +2773,13 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             const range = `${this._formatTs(r.states_imported_start)} \u2192 ${this._formatTs(r.states_imported_end)}`;
             grid += `<span class="result-stat-range" style="grid-column:1/-1">${range}</span>`;
           }
+          if (r.states_unit_converted) {
+            const du = this._esc(r.states_unit_converted.destination);
+            const from = Object.entries(r.states_unit_converted.from || {})
+              .map(([u, n]) => `${n.toLocaleString()} in <strong>${this._esc(u)}</strong>`)
+              .join(", ");
+            grid += `<span class="result-stat-range" style="grid-column:1/-1">Source states recorded in another unit ${r.dry_run ? "would be" : "were"} converted to <strong>${du}</strong>: ${from}.</span>`;
+          }
         }
 
         // --- Statistics summary ---
@@ -2889,7 +2818,16 @@ class MergeSensorsHistoryPanel extends HTMLElement {
           if (r.stats_unit_mismatch) {
             const su = this._esc(r.stats_unit_mismatch.source || "no unit");
             const du = this._esc(r.stats_unit_mismatch.destination || "no unit");
-            grid += `<span class="result-stat-range" style="grid-column:1/-1;color:var(--error-color,#db4437)">&#9888;&#65039; The source's statistics are stored in <strong>${su}</strong> but the destination's in <strong>${du}</strong>. Values ${r.dry_run ? "would be" : "were"} imported exactly as stored, with no conversion. ${this._unitSuggestion(r, results.length)}</span>`;
+            const setNow = r.scale_factor || r.value_function;
+            grid += `<span class="result-stat-range" style="grid-column:1/-1;color:var(--error-color,#db4437)">&#9888;&#65039; The source's statistics are stored in <strong>${su}</strong> but the destination's in <strong>${du}</strong>, and Home Assistant has no conversion between them. Values ${r.dry_run ? "would be" : "were"} imported exactly as stored. If they need scaling, enable <strong>Adjust imported values</strong> under Options${setNow ? " (already set for this run)" : ""}.</span>`;
+          }
+          if (r.stats_unit_converted) {
+            const su = this._esc(r.stats_unit_converted.source);
+            const du = this._esc(r.stats_unit_converted.destination);
+            grid += `<span class="result-stat-range" style="grid-column:1/-1">The source's statistics are stored in <strong>${su}</strong> and the destination's in <strong>${du}</strong>, so they ${r.dry_run ? "would be" : "were"} converted to <strong>${du}</strong>.</span>`;
+          }
+          if ((r.stats_unit_converted || r.states_unit_converted) && (r.scale_factor || r.value_function)) {
+            grid += `<span class="result-stat-range" style="grid-column:1/-1;color:var(--error-color,#db4437)">&#9888;&#65039; <strong>Adjust imported values</strong> ${r.dry_run ? "is" : "was"} also set, and applies on top of the unit conversion. If you set it for this unit change, turn it off, or the values ${r.dry_run ? "would be" : "were"} converted twice.</span>`;
           }
           if (r.stats_sum_seeded !== null && r.stats_sum_seeded !== undefined) {
             const seedStr = this._formatOffset(r.stats_sum_seeded, r.stats_unit);
