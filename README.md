@@ -106,6 +106,7 @@ data:
 
 - **Back up your database** before importing. The integration writes directly to the recorder database. This matters most with [Overwrite mode](#overwrite-mode-destructive), the one option that deletes existing rows.
 - Only data **still in the recorder** can be imported. States are purged by default after ~10 days. Long-term statistics (hourly) are kept indefinitely.
+- **5-minute statistics are imported too**, for the period before the destination's own history, like states and hourly statistics. They are what a statistics graph set to a 5-minute period shows. Home Assistant keeps them for about 10 days only, so an older stretch can only be shown with an hourly (or longer) period. With gap filling enabled, missing 5-minute slots inside the destination's range are filled as well.
 - After importing, the new history will appear in the **History** panel. You may need to refresh the page or wait for the next recorder cycle.
 - **The source entity is never modified or deleted.** The import only writes to the destination. Once you have verified the merge (compare the graphs, check the Energy dashboard), you can remove the old entity yourself: delete it in **Settings > Devices & Services > Entities** (or disable it if you prefer to keep it around), and optionally call the `recorder.purge_entities` service to drop its leftover data from the database.
 - The import is a **one-time operation**, not a continuous sync. Run it once after setting up your new sensors.

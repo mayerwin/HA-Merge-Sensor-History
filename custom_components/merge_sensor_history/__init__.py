@@ -977,11 +977,12 @@ async def _async_import_pair(
         "states_unit_converted": None,  # {"destination": unit, "from": {unit: rows converted}}
         "stats_unit": None,  # Unit of measurement for display
         "dest_is_utility_meter": False,  # Display only: explains the History drop
-        # Short-term statistics (5-minute) — populated only when fill_gaps=True
+        # Short-term statistics (5-minute)
         "stats_short_source_total": 0,
         "stats_short_imported": 0,
         "stats_short_already_covered": 0,
         "stats_short_skipped_recent": 0,
+        "stats_short_skipped_inside": 0,  # inside the destination's range, fill_gaps off
         "stats_short_overwritten": 0,
         "stats_short_imported_start": None,
         "stats_short_imported_end": None,
@@ -1225,42 +1226,55 @@ async def _do_import(
         )
         result["stats_error"] = str(exc)
 
-    # --- 4. Optionally backfill short-term statistics (5-min) ---
-    # Short-term stats are what HA's graphs render for recent data (< ~10 days).
-    # We only do this when the user opts in via fill_gaps, because short-term
-    # cells are dense (12/hour) and the 5-min compile cycle makes the race
-    # window tighter than for hourly LTS.
-    # Overwrite also runs it: replacing known-bad recent data is exactly the
-    # case it exists for, and requiring a second unrelated checkbox to reach
-    # the 5-minute rows would leave the recent graph half-corrected.
-    if fill_gaps or overwrite:
-        try:
-            short_result = await _async_import_short_term_statistics_for_pair(
-                hass,
-                source_id,
-                dest_id,
-                gap_threshold_minutes=gap_threshold_minutes,
-                dry_run=dry_run,
-                transform=transform,
-                overwrite=overwrite,
-            )
-            result.update(short_result)
-        except Exception as exc:
-            _LOGGER.warning(
-                "Short-term statistics backfill failed for %s -> %s: %s",
-                source_id,
-                dest_id,
-                exc,
-            )
-            result["stats_short_error"] = str(exc)
+    # Handed over by the hourly step for the 5-minute one, never returned.
+    dest_first_hourly_ts = result.pop("_dest_first_ts", None)
+    hourly_sum_offset = result.pop("_sum_offset_raw", None)
+
+    # --- 4. Backfill short-term statistics (5-min) ---
+    # Short-term stats are what HA's graphs render for recent data (< ~10 days),
+    # including a statistics graph set to a 5-minute period.
+    # By default only the slots OLDER than everything the destination holds are
+    # filled, the same head-fill the states and hourly steps do. Those slots are
+    # far behind HA's 5-minute compile, so nothing can collide with it.
+    # Filling holes inside the destination's own range (and after its newest
+    # row) is what fill_gaps opts into, since that is where the compile runs.
+    # Overwrite also runs it in full: replacing known-bad recent data is
+    # exactly the case it exists for, and requiring a second unrelated checkbox
+    # to reach the 5-minute rows would leave the recent graph half-corrected.
+    head_only = not (fill_gaps or overwrite)
+    try:
+        short_result = await _async_import_short_term_statistics_for_pair(
+            hass,
+            source_id,
+            dest_id,
+            gap_threshold_minutes=gap_threshold_minutes,
+            dry_run=dry_run,
+            transform=transform,
+            overwrite=overwrite,
+            head_only=head_only,
+            dest_first_hourly_ts=dest_first_hourly_ts,
+            fallback_sum_offset=hourly_sum_offset,
+        )
+        result.update(short_result)
+    except Exception as exc:
+        _LOGGER.warning(
+            "Short-term statistics backfill failed for %s -> %s: %s",
+            source_id,
+            dest_id,
+            exc,
+        )
+        result["stats_short_error"] = str(exc)
+    short_head_bounded = result.pop("_short_head_bounded", False)
 
     # --- 4b. Seed the destination's running total when it has no chain yet ---
     # Planned by the statistics step (see the note there). Queued here so it
     # lands after the imported rows, and skipped when the short-term backfill
-    # already wrote recent rows for the destination — the newest of those is
-    # then the seed HA reads.
+    # already wrote rows for the destination up to the recent cutoff — the
+    # newest of those is then the seed HA reads. A head-only backfill stops
+    # before the destination's own history, so its newest row is not the
+    # latest total and the seed is still needed.
     seed = result.pop("_sum_seed", None)
-    if seed and result.get("stats_short_imported", 0):
+    if seed and result.get("stats_short_imported", 0) and not short_head_bounded:
         seed = None
         result["stats_sum_seeded"] = None
     if seed:
@@ -2356,6 +2370,7 @@ def _build_stats_debug_records(
     trailing_allowed: bool = True,
     gap_threshold_minutes: int | None = None,
     overwrite: bool = False,
+    head_cutoff_ts: float | None = None,
 ) -> list[dict]:
     """Per-source-row classification used for the downloadable debug JSON.
 
@@ -2387,6 +2402,12 @@ def _build_stats_debug_records(
             rec["reason"] = (
                 "Within the recent-compile safety window; HA may still be "
                 "compiling this slot."
+            )
+        elif head_cutoff_ts is not None and start_ts >= head_cutoff_ts:
+            rec["decision"] = "skipped_fill_gaps_disabled"
+            rec["reason"] = (
+                "Inside the destination's own history; only slots before it "
+                "are filled unless Fill gaps is enabled."
             )
         elif (
             dest_max_ts is not None
@@ -2573,6 +2594,11 @@ async def _async_import_statistics_for_pair(
 
     source_rows = source_stats_raw.get(source_id, [])
     dest_rows = dest_stats_raw.get(dest_id, [])
+    # Where the destination's own hourly history begins: the 5-minute step's
+    # default head-fill stops there too (popped by _do_import).
+    out["_dest_first_ts"] = (
+        min(_row_start_ts(r) for r in dest_rows) if dest_rows else None
+    )
 
     # -- Look at the destination's own statistics --
     # Three things, all about how HA will continue the destination's running
@@ -2646,6 +2672,11 @@ async def _async_import_statistics_for_pair(
     else:
         surviving_dest_rows = dest_rows
     sum_offset = _compute_sum_offset(source_rows, surviving_dest_rows, anchor_rows)
+    # The raw splice offset, for a 5-minute backfill that has no destination
+    # 5-minute row to splice against (popped by _do_import). Kept even when the
+    # realignment below hides it from the result, since the lift then applies
+    # to both tables and both must have been shifted by the same amount.
+    out["_sum_offset_raw"] = sum_offset
 
     # -- Build destination row lookup by start_ts --
     # IMPORTANT: a row existing at a given hour does NOT mean it's "covered".
@@ -3239,11 +3270,22 @@ async def _async_import_short_term_statistics_for_pair(
     dry_run: bool = False,
     transform: Callable[[float], float] | None = None,
     overwrite: bool = False,
+    head_only: bool = False,
+    dest_first_hourly_ts: float | None = None,
+    fallback_sum_offset: float | None = None,
 ) -> dict[str, Any]:
     """Backfill short-term (5-minute) statistics from source to destination.
 
-    Opt-in via the `fill_gaps` flag (or `overwrite`, which targets existing
-    data by definition). Behaviors:
+    Behaviors:
+
+    0. **Head-fill by default.** With `head_only` (neither `fill_gaps` nor
+       `overwrite` set), only slots older than everything the destination
+       holds are considered: older than its first 5-minute row and its first
+       hourly row (`dest_first_hourly_ts`). The hourly bound matters when the
+       destination's own 5-minute rows have been purged, or it has hourly rows
+       but never compiled any: the slots after that point lie inside its
+       history and are not missing, they are gone. Without `head_only`, every
+       missing slot is filled, subject to the rules below.
 
     1. **Gap-fill, not overwrite.** Only inserts for 5-min slots where the
        destination has no existing short-term row, using the same column-merge
@@ -3259,8 +3301,11 @@ async def _async_import_short_term_statistics_for_pair(
        `gap_threshold_minutes`. Mid-stream missing slots are always filled
        (bounded by the recent-cutoff rule).
 
-    4. **Cumulative-sum offset for energy sensors.** Reuses the same splice-
-       point offset the LTS path computes.
+    4. **Cumulative-sum offset for energy sensors.** Same splice-point rule as
+       the LTS path, against the destination's 5-minute rows. When the
+       destination has no 5-minute row with a sum, `fallback_sum_offset` (the
+       hourly step's offset) is used, so both tables are shifted by the same
+       constant and a later realignment lifts them back together.
 
     5. **Preserve existing destination metadata.** Same reasoning as LTS.
 
@@ -3273,10 +3318,12 @@ async def _async_import_short_term_statistics_for_pair(
         "stats_short_imported": 0,
         "stats_short_already_covered": 0,
         "stats_short_skipped_recent": 0,
+        "stats_short_skipped_inside": 0,
         "stats_short_overwritten": 0,
         "stats_short_imported_start": None,
         "stats_short_imported_end": None,
         "debug_stats_short": [],
+        "_short_head_bounded": False,
     }
 
     # -- Recent-slot cutoff: floor_5min(now) - 10 min --
@@ -3324,9 +3371,21 @@ async def _async_import_short_term_statistics_for_pair(
         ]
     else:
         surviving_dest_rows = dest_rows
-    sum_offset = _compute_sum_offset(source_rows, surviving_dest_rows)
+    if any(r.get("sum") is not None for r in surviving_dest_rows):
+        sum_offset = _compute_sum_offset(source_rows, surviving_dest_rows)
+    else:
+        sum_offset = fallback_sum_offset
 
     dest_by_start: dict[float, dict] = {_row_start_ts(r): r for r in dest_rows}
+
+    # Head-fill bound: the start of everything the destination holds.
+    head_cutoff_ts: float | None = None
+    if head_only:
+        firsts = [ts for ts in (dest_first_hourly_ts,) if ts is not None]
+        if dest_rows:
+            firsts.append(min(dest_by_start))
+        head_cutoff_ts = min(firsts) if firsts else None
+    out["_short_head_bounded"] = head_cutoff_ts is not None
 
     # Trailing-edge threshold: only fill slots after dest_max_ts if the gap
     # from there to now() meets the user's threshold. Overwrite bypasses the
@@ -3343,6 +3402,7 @@ async def _async_import_short_term_statistics_for_pair(
     to_import_rows: list[tuple[float, dict[str, Any]]] = []
     already_covered = 0
     skipped_recent = 0
+    skipped_inside = 0
     overwritten = 0
     debug_stats_short = _build_stats_debug_records(
         source_rows,
@@ -3354,12 +3414,17 @@ async def _async_import_short_term_statistics_for_pair(
         trailing_allowed=trailing_allowed,
         gap_threshold_minutes=gap_threshold_minutes,
         overwrite=overwrite,
+        head_cutoff_ts=head_cutoff_ts,
     )
 
     for src_row in source_rows:
         start_ts = _row_start_ts(src_row)
         if start_ts > recent_cutoff_ts:
             skipped_recent += 1
+            continue
+
+        if head_cutoff_ts is not None and start_ts >= head_cutoff_ts:
+            skipped_inside += 1
             continue
 
         # Trailing gate: source rows beyond dest's newest are only taken if the
@@ -3416,6 +3481,7 @@ async def _async_import_short_term_statistics_for_pair(
 
     out["stats_short_already_covered"] = already_covered
     out["stats_short_skipped_recent"] = skipped_recent
+    out["stats_short_skipped_inside"] = skipped_inside
     out["stats_short_overwritten"] = overwritten
     out["debug_stats_short"] = debug_stats_short
 

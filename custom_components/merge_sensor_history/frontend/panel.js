@@ -2844,7 +2844,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             grid += `<span class="result-stat-error">Error: ${r.stats_error}</span>`;
         }
 
-        // --- Short-term statistics summary (only shown when backfill ran) ---
+        // --- Short-term statistics summary (only shown when the source had any) ---
         const hasShortInfo =
           (r.stats_short_source_total || 0) > 0 ||
           (r.stats_short_imported || 0) > 0 ||
@@ -2857,6 +2857,8 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             grid += `<span class="result-stat-value">${r.stats_short_already_covered.toLocaleString()}</span><span class="result-stat-label">already complete in destination</span>`;
           if (r.stats_short_overwritten > 0)
             grid += `<span class="result-stat-value">${r.stats_short_overwritten.toLocaleString()}</span><span class="result-stat-label">existing slots ${r.dry_run ? "would be overwritten" : "overwritten"}</span>`;
+          if (r.stats_short_skipped_inside > 0)
+            grid += `<span class="result-stat-value">${r.stats_short_skipped_inside.toLocaleString()}</span><span class="result-stat-label">skipped (inside the destination's own range, enable gap filling to fill these)</span>`;
           if (r.stats_short_skipped_recent > 0)
             grid += `<span class="result-stat-value">${r.stats_short_skipped_recent.toLocaleString()}</span><span class="result-stat-label">skipped (too recent or under threshold)</span>`;
           grid += `<span class="result-stat-value">${(r.stats_short_imported || 0).toLocaleString()}</span><span class="result-stat-label">${actionVerb}</span>`;
