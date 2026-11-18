@@ -21,8 +21,8 @@ Built for migrating sensor data between integrations — for example, when repla
 
 1. Reads **all** historical states from the source entity via the recorder API
 2. Queries the destination entity's **oldest good entry**. Hidden `unavailable`/`unknown` rows are not counted as coverage: a destination whose earliest rows are just unavailable markers (common when the entity id existed before, e.g. as a ghost of a removed integration) has no visible history there
-3. Imports only source states that are **strictly older** than that oldest good entry, skipping any exact-timestamp duplicates. This prevents overlap or duplication
-4. Imports **long-term statistics** (hourly mean/min/max/sum) via the official `async_import_statistics` API, which is inherently deduplicated by the database schema
+3. Imports only source **states** (the raw history) that are **strictly older** than that oldest good entry, skipping any exact-timestamp duplicates. This prevents overlap or duplication
+4. Imports **long-term statistics** (hourly mean/min/max/sum) via the official `async_import_statistics` API, which is inherently deduplicated by the database schema. For energy-type sensors, the destination's existing and future cumulative `sum` is **lifted by a constant** so the imported history and the new sensor's data form one continuous series (see [Important notes](#important-notes))
 5. Commits everything in a **single transaction**, so if anything fails the whole import is rolled back and you can safely retry
 
 ### What gets imported
