@@ -18,7 +18,7 @@ import_history:
         entity:
     fill_gaps:
       name: Fill Gaps
-      description: "Also fill gaps inside the destination's existing time range (and after its newest entry) with source data."
+      description: "Also fill gaps inside the destination's existing time range (and after its newest entry, if it is currently unavailable) with source data. A stretch where the destination held a steady value, which its statistics show, is not a gap."
       required: false
       default: false
       selector:

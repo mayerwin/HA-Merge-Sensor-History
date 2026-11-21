@@ -1492,6 +1492,52 @@ class _ImportStatesTask(RecorderTask if RecorderTask is not None else object):  
             self._future.set_exception(exc)
 
 
+def _fetch_dest_stats_coverage(
+    session: Any, statistic_id: str
+) -> tuple[set[int], set[int], int | None] | None:
+    """Start times of the destination's hourly and 5-minute statistics rows.
+
+    None when the destination has no statistics at all (a sensor without a
+    state class): there is then no way to tell a steady value from a gap, and
+    gap filling falls back to the timestamps alone.
+    """
+    metadata_id = (
+        session.query(StatisticsMeta.id)
+        .filter(StatisticsMeta.statistic_id == statistic_id)
+        .scalar()
+    )
+    if metadata_id is None:
+        return None
+    hourly = {
+        int(row[0])
+        for row in session.query(Statistics.start_ts).filter(
+            Statistics.metadata_id == metadata_id
+        )
+    }
+    short = {
+        int(row[0])
+        for row in session.query(StatisticsShortTerm.start_ts).filter(
+            StatisticsShortTerm.metadata_id == metadata_id
+        )
+    }
+    return hourly, short, (min(short) if short else None)
+
+
+def _ts_covered_by_stats(
+    cover: tuple[set[int], set[int], int | None] | None, ts: float
+) -> bool:
+    """Whether the destination has a statistics row for the slot holding ts."""
+    if cover is None:
+        return False
+    hourly, short, short_min = cover
+    # 5-minute rows are kept for about 10 days and are the finer record of
+    # when the sensor had a value, so they decide wherever they reach. An
+    # hour the sensor was unavailable for most of still gets an hourly row.
+    if short_min is not None and ts >= short_min:
+        return int(ts // 300) * 300 in short
+    return int(ts // 3600) * 3600 in hourly
+
+
 def _insert_states(
     recorder_instance: Any,
     dest_entity_id: str,
@@ -1534,9 +1580,14 @@ def _insert_states(
     - **Mid-stream fill (when `fill_gaps` is True):** for each pair of adjacent
       destination state timestamps whose delta is >= `gap_threshold_minutes`,
       import all source states strictly between them.
-    - **Trailing fill (when `fill_gaps` is True):** if (now - destination_max_ts)
-      is >= `gap_threshold_minutes`, import all source states strictly newer
-      than the destination's newest entry.
+    - **Trailing fill (when `fill_gaps` is True):** if the destination's
+      newest row is unavailable/unknown and (now - newest good entry) is
+      >= `gap_threshold_minutes`, import all source states strictly newer
+      than the destination's newest good entry.
+    - In both gap modes, a source state is skipped when the destination has
+      statistics (hourly or 5-minute) for that time: Home Assistant writes a
+      state row only on change, so a quiet stretch the destination compiled
+      statistics for is a steady value, not missing data.
 
     Deduplication: source states whose `last_updated` timestamp exactly matches
     an existing destination timestamp are skipped (prevents introducing
@@ -1737,6 +1788,7 @@ def _insert_states(
             dest_max_good_ts: float | None = None
             trailing_allowed = False
             threshold_sec = gap_threshold_minutes * 60.0
+            stats_cover: tuple[set[int], set[int], int | None] | None = None
 
             if fill_gaps:
                 # Load every destination row's timestamp + state value (ordered).
@@ -1769,9 +1821,26 @@ def _insert_states(
                 if good_dest_ts_list:
                     dest_max_good_ts = good_dest_ts_list[-1]
                     now_ts = datetime.now(timezone.utc).timestamp()
+                    # Home Assistant writes a state row only when the value
+                    # changes, so time after the newest row is NOT missing
+                    # data when that row is a good value: the sensor has held
+                    # it ever since (a solar counter overnight, for one). Only
+                    # a destination that is currently unavailable/unknown has
+                    # a real trailing gap.
+                    newest_state = dest_rows[-1][1]
                     trailing_allowed = (
                         now_ts - dest_max_good_ts
-                    ) >= threshold_sec
+                    ) >= threshold_sec and (
+                        newest_state is None or newest_state in _NON_GOOD_STATES
+                    )
+
+                # The same holds between two good rows: a quiet stretch is a
+                # steady value, not a gap. The destination's own statistics
+                # tell the two apart: Home Assistant compiles a row every 5
+                # minutes and every hour for as long as the sensor has a
+                # value, changing or not, and none while it is unavailable or
+                # not being recorded. A slot it has statistics for is covered.
+                stats_cover = _fetch_dest_stats_coverage(session, dest_entity_id)
 
             for s in source_states:
                 ts = s.last_updated.timestamp()
@@ -1877,6 +1946,12 @@ def _insert_states(
                             "Source value is unavailable/unknown and not in "
                             "a qualifying gap."
                         )
+                elif _ts_covered_by_stats(stats_cover, ts):
+                    rec["decision"] = "skipped_dest_recording"
+                    rec["reason"] = (
+                        "The destination has statistics for this time, so it "
+                        "was recording a steady value: not a gap."
+                    )
                 elif dest_max_good_ts is not None and ts > dest_max_good_ts:
                     if trailing_allowed:
                         trailing.append(s)
@@ -1886,10 +1961,11 @@ def _insert_states(
                             "gap meets threshold."
                         )
                     else:
-                        rec["decision"] = "skipped_trailing_below_threshold"
+                        rec["decision"] = "skipped_trailing_not_a_gap"
                         rec["reason"] = (
-                            "Past destination's newest good but trailing gap "
-                            f"is below {gap_threshold_minutes} min threshold."
+                            "Past destination's newest good entry, but the "
+                            "destination still holds that value (or the gap "
+                            f"is below {gap_threshold_minutes} min): not a gap."
                         )
                 elif (
                     prev_good is not None

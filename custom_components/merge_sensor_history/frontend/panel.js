@@ -978,7 +978,7 @@ class MergeSensorsHistoryPanel extends HTMLElement {
             <span class="option-label">Gap threshold:</span>
             <input type="number" id="gap-threshold" min="1" max="1440" value="60" />
             <span class="option-unit">minutes</span>
-            <span class="option-hint">&mdash; a gap is any period this long where the destination has no state but the source does</span>
+            <span class="option-hint">&mdash; a gap is any period this long where the destination was unavailable or not recorded (a steady value that simply did not change is not a gap)</span>
           </div>
           <label class="option-row" style="margin-top:14px" title="Change every numeric value read from the source (states and statistics) before importing. Units Home Assistant knows how to convert (kWh and Wh, °C and °F, ...) are converted for you without this; use it for anything else, such as a sensor that reported the wrong scale.">
             <input type="checkbox" id="scale-cb" />
